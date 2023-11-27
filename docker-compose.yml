@@ -9,12 +9,19 @@ services:
             - /var/run/docker.sock:/var/run/docker.sock
         networks:
             - agenta-network
+
     backend:
         build: ./agenta-backend
         environment:
             - MONGODB_URI=mongodb://username:password@mongo:27017
+            - REDIS_URL=redis://redis:6379/0
             - ENVIRONMENT=development
+            - DATABASE_MODE=v2
             - BARE_DOMAIN_NAME=localhost
+            - DOMAIN_NAME=http://localhost
+            - FEATURE_FLAG=oss
+            - AGENTA_TEMPLATE_REPO=agentaai/templates_v2
+            - POSTHOG_API_KEY=phc_hmVSxIjTW1REBHXgj2aw4HW9X6CXb6FzerBgP9XenC7
         volumes:
             - ./agenta-backend/agenta_backend:/app/agenta_backend
             - ./agenta-backend/tests:/app/tests
@@ -28,7 +35,6 @@ services:
             - "traefik.http.routers.backend.middlewares=backend-strip"
             - "traefik.http.services.backend.loadbalancer.server.port=8000"
             - "traefik.http.routers.backend.service=backend"
-
         networks:
             - agenta-network
         command:
@@ -45,6 +51,9 @@ services:
                 "--root-path",
                 "/api"
             ]
+        depends_on:
+            mongo:
+                condition: service_healthy
 
     agenta-web:
         build:
@@ -53,18 +62,17 @@ services:
         volumes:
             - ./agenta-web/src:/app/src
             - ./agenta-web/public:/app/public
-            - ./agenta-web/.env.development.local:/app/.env.development.local
+            - .nextjs_cache:/app/.next
         ports:
             - "3000:3000"
-        environment:
-            - NODE_ENV=development
-            - NEXT_PUBLIC_AGENTA_API_URL=http://localhost
         networks:
             - agenta-network
         labels:
             - "traefik.http.routers.agenta-web.rule=PathPrefix(`/`)"
             - "traefik.http.routers.agenta-web.entrypoints=web"
             - "traefik.http.services.agenta-web.loadbalancer.server.port=3000"
+        environment:
+            - NEXT_PUBLIC_POSTHOG_API_KEY=phc_hmVSxIjTW1REBHXgj2aw4HW9X6CXb6FzerBgP9XenC7
 
     mongo:
         image: mongo:5.0

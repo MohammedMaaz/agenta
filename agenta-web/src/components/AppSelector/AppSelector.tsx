@@ -1,25 +1,41 @@
-import {useState, useEffect} from "react"
+import {useState, useEffect, useMemo} from "react"
 import {useRouter} from "next/router"
+import {usePostHog} from "posthog-js/react"
 import {PlusOutlined} from "@ant-design/icons"
 import {Input, Modal, ConfigProvider, theme, Spin, Card, Button, notification, Divider} from "antd"
 import AppCard from "./AppCard"
-import {Template, AppTemplate, TemplateImage} from "@/lib/Types"
+import {Template, GenericObject} from "@/lib/Types"
 import {useAppTheme} from "../Layout/ThemeContextProvider"
 import {CloseCircleFilled} from "@ant-design/icons"
 import TipsAndFeatures from "./TipsAndFeatures"
 import Welcome from "./Welcome"
-import {isAppNameInputValid} from "@/lib/helpers/utils"
-import {fetchApps, getTemplates, pullTemplateImage, startTemplate} from "@/lib/services/api"
+import {getOpenAIKey, isAppNameInputValid, isDemo} from "@/lib/helpers/utils"
+import {
+    createAndStartTemplate,
+    getProfile,
+    getTemplates,
+    removeApp,
+    waitForAppToStart,
+} from "@/lib/services/api"
 import AddNewAppModal from "./modals/AddNewAppModal"
 import AddAppFromTemplatedModal from "./modals/AddAppFromTemplateModal"
+import MaxAppModal from "./modals/MaxAppModal"
 import WriteOwnAppModal from "./modals/WriteOwnAppModal"
 import {createUseStyles} from "react-jss"
+import {useAppsData} from "@/contexts/app.context"
+import {useProfileData} from "@/contexts/profile.context"
+import CreateAppStatusModal from "./modals/CreateAppStatusModal"
 
 type StyleProps = {
     themeMode: "dark" | "light"
 }
 
 const useStyles = createUseStyles({
+    container: ({themeMode}: StyleProps) => ({
+        marginTop: 10,
+        width: "100%",
+        color: themeMode === "dark" ? "#fff" : "#000",
+    }),
     cardsList: ({themeMode}: StyleProps) => ({
         display: "flex",
         flexWrap: "wrap",
@@ -33,33 +49,88 @@ const useStyles = createUseStyles({
         backgroundColor: "#1777FF",
         borderColor: "#1777FF !important",
         color: "#FFFFFF",
+        width: 300,
+        height: 120,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        cursor: "pointer",
         "& .ant-card-meta-title": {
             color: "#FFFFFF",
         },
     },
+    createCardMeta: {
+        height: "90%",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-evenly",
+    },
+    closeIcon: {
+        fontSize: 20,
+        color: "red",
+    },
+    divider: ({themeMode}: StyleProps) => ({
+        marginTop: 0,
+        borderColor: themeMode === "dark" ? "rgba(256, 256, 256, 0.2)" : "rgba(5, 5, 5, 0.15)",
+    }),
+    h1: {
+        fontSize: 24,
+    },
+    modal: {
+        "& .ant-modal-body": {
+            display: "flex",
+            flexDirection: "column",
+            gap: "0.75rem",
+            marginTop: 20,
+        },
+    },
+    modalError: {
+        color: "red",
+        marginLeft: "10px",
+    },
+    modalBtn: {
+        alignSelf: "flex-end",
+    },
 })
+
+const timeout = isDemo() ? 60000 : 30000
 
 const AppSelector: React.FC = () => {
     const router = useRouter()
+    const posthog = usePostHog()
     const {appTheme} = useAppTheme()
     const classes = useStyles({themeMode: appTheme} as StyleProps)
     const [isCreateAppModalOpen, setIsCreateAppModalOpen] = useState(false)
     const [isCreateAppFromTemplateModalOpen, setIsCreateAppFromTemplateModalOpen] = useState(false)
     const [isWriteAppModalOpen, setIsWriteAppModalOpen] = useState(false)
+    const [isMaxAppModalOpen, setIsMaxAppModalOpen] = useState(false)
     const [templates, setTemplates] = useState<Template[]>([])
 
     const [templateMessage, setTemplateMessage] = useState("")
-    const [templateName, setTemplateName] = useState<string | undefined>(undefined)
+    const [templateId, setTemplateId] = useState<string | undefined>(undefined)
     const [isInputTemplateModalOpen, setIsInputTemplateModalOpen] = useState<boolean>(false)
+    const [statusModalOpen, setStatusModalOpen] = useState(false)
     const [fetchingTemplate, setFetchingTemplate] = useState(false)
-    const [appNameExist, setAppNameExist] = useState(false)
     const [newApp, setNewApp] = useState("")
+    const {selectedOrg} = useProfileData()
+    const {apps, error, isLoading, mutate} = useAppsData()
+    const [statusData, setStatusData] = useState<{status: string; details?: any; appId?: string}>({
+        status: "",
+        details: undefined,
+        appId: undefined,
+    })
 
-    const showCreateAppModal = () => {
+    const trackingEnabled = process.env.NEXT_PUBLIC_TELEMETRY_TRACKING_ENABLED === "true"
+    const showCreateAppModal = async () => {
         setIsCreateAppModalOpen(true)
     }
 
+    const showMaxAppError = () => {
+        setIsMaxAppModalOpen(true)
+    }
     const showCreateAppFromTemplateModal = () => {
+        setTemplateId(undefined)
+        setNewApp("")
         setIsCreateAppModalOpen(false)
         setIsCreateAppFromTemplateModalOpen(true)
     }
@@ -89,23 +160,10 @@ const AppSelector: React.FC = () => {
     const handleInputTemplateModalCancel = () => {
         if (fetchingTemplate) return
         setIsInputTemplateModalOpen(false)
-        setNewApp("")
-        setTemplateName(undefined)
-    }
-
-    const handleNavigation = () => {
-        notification.success({
-            message: "Template Selection",
-            description:
-                "Once your app is up and running, you'll be redirected to the app playground.",
-            duration: 9,
-        })
-        setTimeout(() => {
-            router.push(`/apps/${newApp}/playground`)
-        }, 10000)
     }
 
     useEffect(() => {
+        if (!isLoading) mutate()
         const fetchTemplates = async () => {
             const data = await getTemplates()
             if (typeof data == "object") {
@@ -118,103 +176,88 @@ const AppSelector: React.FC = () => {
         fetchTemplates()
     }, [])
 
-    const fetchTemplateImage = async (image_name: string) => {
-        const response = await pullTemplateImage(image_name)
-        return response
-    }
+    const handleTemplateCardClick = async (template_id: string) => {
+        handleInputTemplateModalCancel()
+        handleCreateAppFromTemplateModalCancel()
+        handleCreateAppModalCancel()
 
-    const retrieveOpenAIKey = () => {
-        const apiKey = localStorage.getItem("openAiToken")
-        return apiKey
-    }
-
-    const createAppVariantFromTemplateImage = async (
-        app_name: string,
-        image_id: string,
-        image_tag: string,
-        api_key: string,
-    ) => {
-        const variantData: AppTemplate = {
-            app_name: app_name,
-            image_id: image_id,
-            image_tag: image_tag,
-            env_vars: {
-                OPENAI_API_KEY: api_key,
-            },
-        }
-        const response = await startTemplate(variantData)
-        if (response.status == 200) {
-            notification.success({
-                message: "Template Selection",
-                description: "App has been created and will begin to run.",
-                duration: 5,
-            })
-            return response
-        } else {
-            notification.error({
-                message: "Template Selection",
-                description: "An error occured when trying to start the variant.",
-                duration: 5,
-            })
-            setFetchingTemplate(false)
-            return
-        }
-    }
-
-    const handleTemplateCardClick = async (image_name: string) => {
-        setFetchingTemplate(true)
-
-        const OpenAIKey = retrieveOpenAIKey() as string
-        if (OpenAIKey === null) {
+        // warn the user and redirect if openAI key is not present
+        const openAIKey = getOpenAIKey()
+        if (!openAIKey && !isDemo()) {
             notification.error({
                 message: "OpenAI API Key Missing",
                 description: "Please provide your OpenAI API key to access this feature.",
                 duration: 5,
             })
-            router.push("/apikeys")
+            router.push("/settings?tab=secrets")
             return
         }
 
-        notification.info({
-            message: "Template Selection",
-            description: "Fetching template image...",
-            duration: 10,
-        })
+        setFetchingTemplate(true)
+        setStatusModalOpen(true)
 
-        const data: TemplateImage = await fetchTemplateImage(image_name)
-        if (data.message) {
-            notification.error({
-                message: "Template Selection",
-                description: `${data.message}!`,
-                duration: 10,
-            })
-            setFetchingTemplate(false)
-        } else {
-            notification.info({
-                message: "Template Section",
-                description: "Creating variant from template image...",
-                duration: 15,
-            })
-            await createAppVariantFromTemplateImage(
-                newApp,
-                data.image_id,
-                data.image_tag,
-                OpenAIKey,
-            ).finally(() => {
-                handleCreateAppFromTemplateModalCancel()
-                handleCreateAppModalCancel()
-                handleNavigation()
-            })
-        }
+        // attempt to create and start the template, notify user of the progress
+        await createAndStartTemplate({
+            appName: newApp,
+            templateId: template_id,
+            orgId: selectedOrg?.id!,
+            openAIKey: isDemo() ? "" : (openAIKey as string),
+            timeout,
+            onStatusChange: (status, details, appId) => {
+                setStatusData((prev) => ({status, details, appId: appId || prev.appId}))
+                if (["error", "bad_request", "timeout", "success"].includes(status))
+                    setFetchingTemplate(false)
+                if (status === "success") {
+                    mutate()
+
+                    if (trackingEnabled) {
+                        // Get user profile
+                        getProfile().then((res) => {
+                            // Update distinct_id and track successfully app variant deployment
+                            posthog?.identify(res?.data?.id)
+                            posthog?.capture("app_deployment", {
+                                properties: {
+                                    app_id: appId,
+                                    environment: "UI",
+                                    deployed_by: res?.data?.id,
+                                },
+                            })
+                        })
+                    }
+                }
+            },
+        })
     }
 
-    const {data, error, isLoading} = fetchApps()
-
-    useEffect(() => {
-        if (data) {
-            setAppNameExist(data.some((app) => app.app_name === newApp))
+    const onErrorRetry = async () => {
+        if (statusData.appId) {
+            setStatusData((prev) => ({...prev, status: "cleanup", details: undefined}))
+            await removeApp(statusData.appId).catch(console.error)
+            mutate()
         }
-    }, [data, newApp])
+        handleTemplateCardClick(templateId as string)
+    }
+
+    const onTimeoutRetry = async () => {
+        if (!statusData.appId) return
+        setStatusData((prev) => ({...prev, status: "starting_app", details: undefined}))
+        try {
+            await waitForAppToStart({appId: statusData.appId, timeout})
+        } catch (error: any) {
+            if (error.message === "timeout") {
+                setStatusData((prev) => ({...prev, status: "timeout", details: undefined}))
+            } else {
+                setStatusData((prev) => ({...prev, status: "error", details: error}))
+            }
+        }
+        setStatusData((prev) => ({...prev, status: "success", details: undefined}))
+        mutate()
+    }
+
+    const appNameExist = useMemo(
+        () => apps.some((app: GenericObject) => app.app_name === newApp),
+        [apps, newApp],
+    )
 
     return (
         <ConfigProvider
@@ -222,72 +265,43 @@ const AppSelector: React.FC = () => {
                 algorithm: appTheme === "dark" ? theme.darkAlgorithm : theme.defaultAlgorithm,
             }}
         >
-            <div
-                style={{
-                    maxWidth: "1450px",
-                    marginTop: 10,
-                    width: "100%",
-                    color: appTheme === "dark" ? "#fff" : "#000",
-                }}
-            >
+            <div className={classes.container}>
                 {isLoading ? (
-                    <div className="appSelectorMssg">
+                    <div>
                         <Spin />
                         <h1>loading...</h1>
                     </div>
                 ) : error ? (
-                    <div className="appSelectorMssg">
-                        <CloseCircleFilled style={{fontSize: 20, color: "red"}} />
+                    <div>
+                        <CloseCircleFilled className={classes.closeIcon} />
                         <h1>failed to load</h1>
                     </div>
-                ) : Array.isArray(data) && data.length ? (
+                ) : Array.isArray(apps) && apps.length ? (
                     <>
-                        <h1 style={{fontSize: 22}}>LLM Applications</h1>
-                        <Divider
-                            style={{
-                                marginTop: 0,
-                                borderColor:
-                                    appTheme === "dark"
-                                        ? "rgba(256, 256, 256, 0.2)"
-                                        : "rgba(5, 5, 5, 0.15)",
-                            }}
-                        />
+                        <h1 className={classes.h1}>LLM Applications</h1>
+                        <Divider className={classes.divider} />
                         <div className={classes.cardsList}>
-                            {Array.isArray(data) && (
+                            {Array.isArray(apps) && (
                                 <>
-                                    {data.map((app: any, index: number) => (
+                                    {apps.map((app, index: number) => (
                                         <div key={index}>
-                                            <AppCard
-                                                appName={app.app_name}
-                                                key={index}
-                                                index={index}
-                                            />
+                                            <AppCard app={app} />
                                         </div>
                                     ))}
                                     <Card
                                         className={classes.createCard}
-                                        style={{
-                                            width: 300,
-                                            height: 120,
-                                            display: "flex",
-                                            alignItems: "center",
-                                            justifyContent: "center",
-                                            cursor: "pointer",
+                                        onClick={() => {
+                                            if (isDemo() && apps.length > 2) {
+                                                showMaxAppError()
+                                            } else {
+                                                showCreateAppModal()
+                                            }
                                         }}
-                                        onClick={showCreateAppModal}
                                     >
                                         <Card.Meta
-                                            style={{
-                                                height: "90%",
-                                                display: "flex",
-                                                alignItems: "center",
-                                                justifyContent: "space-evenly",
-                                            }}
-                                            title={
-                                                <div style={{textAlign: "center"}}>
-                                                    Create New App
-                                                </div>
-                                            }
+                                            data-cy="create-new-app-button"
+                                            className={classes.createCardMeta}
+                                            title={<div>Create New App</div>}
                                             avatar={<PlusOutlined size={24} />}
                                         />
                                     </Card>
@@ -298,7 +312,10 @@ const AppSelector: React.FC = () => {
                         <TipsAndFeatures />
                     </>
                 ) : (
-                    <Welcome onCreateAppClick={showCreateAppModal} />
+                    <Welcome
+                        onWriteOwnApp={showWriteAppModal}
+                        onCreateFromTemplate={showCreateAppFromTemplateModal}
+                    />
                 )}
             </div>
 
@@ -316,22 +333,24 @@ const AppSelector: React.FC = () => {
                 noTemplateMessage={templateMessage}
                 onCardClick={(template) => {
                     showInputTemplateModal()
-                    setTemplateName(template.image.name)
+                    setTemplateId(template.id)
+                }}
+            />
+            <MaxAppModal
+                open={isMaxAppModalOpen}
+                onCancel={() => {
+                    setIsMaxAppModalOpen(false)
                 }}
             />
             <Modal
-                title="Input app name"
+                data-cy="enter-app-name-modal"
+                title="Enter the app name"
                 open={isInputTemplateModalOpen}
                 onCancel={handleInputTemplateModalCancel}
                 width={500}
                 footer={null}
                 centered
-                bodyStyle={{
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: "0.75rem",
-                    marginTop: 20,
-                }}
+                className={classes.modal}
             >
                 <Input
                     placeholder="New app name (e.g., chat-app)"
@@ -339,18 +358,18 @@ const AppSelector: React.FC = () => {
                     onChange={(e) => setNewApp(e.target.value)}
                     disabled={fetchingTemplate}
                 />
-                {appNameExist && (
-                    <div style={{color: "red", marginLeft: "10px"}}>App name already exist</div>
-                )}
+                {appNameExist && <div className={classes.modalError}>App name already exist</div>}
                 {newApp.length > 0 && !isAppNameInputValid(newApp) && (
-                    <div style={{color: "red", marginLeft: "10px"}}>
+                    <div className={classes.modalError} data-cy="enter-app-name-modal-text-warning">
                         App name must contain only letters, numbers, underscore, or dash
                     </div>
                 )}
                 <Button
-                    style={{alignSelf: "flex-end"}}
+                    data-cy="enter-app-name-modal-button"
+                    className={classes.modalBtn}
                     type="primary"
                     loading={fetchingTemplate}
+                    disabled={appNameExist || newApp.length === 0}
                     onClick={() => {
                         if (appNameExist) {
                             notification.warning({
@@ -375,7 +394,7 @@ const AppSelector: React.FC = () => {
                             newApp.length > 0 &&
                             isAppNameInputValid(newApp)
                         ) {
-                            handleTemplateCardClick(templateName)
+                            handleTemplateCardClick(templateId as string)
                         } else {
                             notification.warning({
                                 message: "Template Selection",
@@ -389,6 +408,15 @@ const AppSelector: React.FC = () => {
                     Create
                 </Button>
             </Modal>
+            <CreateAppStatusModal
+                open={statusModalOpen}
+                loading={fetchingTemplate}
+                onErrorRetry={onErrorRetry}
+                onTimeoutRetry={onTimeoutRetry}
+                onCancel={() => setStatusModalOpen(false)}
+                statusData={statusData}
+                appName={newApp}
+            />
 
             <WriteOwnAppModal open={isWriteAppModalOpen} onCancel={handleWriteApppModalCancel} />
         </ConfigProvider>

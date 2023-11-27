@@ -1,46 +1,113 @@
-import React from "react"
-import {Col, Row, Divider, Button, Tooltip, Spin} from "antd"
+import React, {useEffect, useRef} from "react"
+import {Col, Row, Divider, Button, Tooltip, Spin, notification, Result} from "antd"
 import TestView from "./Views/TestView"
 import ParametersView from "./Views/ParametersView"
 import {useVariant} from "@/lib/hooks/useVariant"
-import {Variant} from "@/lib/Types"
+import {Environment, Variant} from "@/lib/Types"
 import {useRouter} from "next/router"
 import {useState} from "react"
-import {is} from "cypress/types/bluebird"
+import axios from "axios"
+import {createUseStyles} from "react-jss"
+import {
+    getAppContainerURL,
+    removeVariant,
+    restartAppVariantContainer,
+    waitForAppToStart,
+} from "@/lib/services/api"
+import {useAppsData} from "@/contexts/app.context"
+import {isDemo} from "@/lib/helpers/utils"
 
 interface Props {
     variant: Variant
     handlePersistVariant: (variantName: string) => void
-    setRemovalVariantName: (variantName: string) => void
-    setRemovalWarningModalOpen: (value: boolean) => void
-    isDeleteLoading: boolean
+    environments: Environment[]
+    onAdd: () => void
+    deleteVariant: (deleteAction?: Function) => void
+    getHelpers: (helpers: {save: Function; delete: Function}) => void
+    onStateChange: (isDirty: boolean) => void
 }
+
+const useStyles = createUseStyles({
+    row: {
+        marginTop: "20px",
+    },
+    restartBtnMargin: {
+        marginRight: "10px",
+    },
+})
 
 const ViewNavigation: React.FC<Props> = ({
     variant,
     handlePersistVariant,
-    setRemovalVariantName,
-    setRemovalWarningModalOpen,
-    isDeleteLoading,
+    environments,
+    onAdd,
+    deleteVariant,
+    getHelpers,
+    onStateChange,
 }) => {
+    const classes = useStyles()
     const router = useRouter()
-    const appName = router.query.app_name as unknown as string
+    const appId = router.query.app_id as unknown as string
     const {
         inputParams,
         optParams,
-        URIPath,
+        refetch,
         isError,
         error,
         isParamSaveLoading,
         saveOptParams,
         isLoading,
-    } = useVariant(appName, variant)
-
+        isChatVariant,
+    } = useVariant(appId, variant)
+    const [retrying, setRetrying] = useState(false)
     const [isParamsCollapsed, setIsParamsCollapsed] = useState("1")
+    const [containerURI, setContainerURI] = useState("")
+    const [restarting, setRestarting] = useState<boolean>(false)
+    const {currentApp} = useAppsData()
+    const retriedOnce = useRef(false)
+    const netWorkError = (error as any)?.code === "ERR_NETWORK"
+
+    let prevKey = ""
+    const showNotification = (config: Parameters<typeof notification.open>[0]) => {
+        if (prevKey) notification.destroy(prevKey)
+        prevKey = (config.key || "") as string
+        notification.open(config)
+    }
+
+    useEffect(() => {
+        if (netWorkError) {
+            retriedOnce.current = true
+            setRetrying(true)
+            waitForAppToStart({appId, variant, timeout: isDemo() ? 40000 : 6000})
+                .then(() => {
+                    refetch()
+                })
+                .catch(() => {
+                    showNotification({
+                        type: "error",
+                        message: "Variant unreachable",
+                        description: `Unable to connect to the variant.`,
+                    })
+                })
+                .finally(() => {
+                    setRetrying(false)
+                })
+        }
+    }, [netWorkError])
+
+    if (retrying || (!retriedOnce.current && netWorkError)) {
+        return (
+            <Result
+                status="info"
+                title="Waiting for the variant to start"
+                extra={<Spin spinning={retrying} />}
+            />
+        )
+    }
 
     if (isError) {
         let variantDesignator = variant.templateVariantName
-        let imageName = `agenta-server/${appName.toLowerCase()}_`
+        let imageName = `agentaai/${(currentApp?.app_name || "").toLowerCase()}_`
 
         if (!variantDesignator || variantDesignator === "") {
             variantDesignator = variant.variantName
@@ -49,14 +116,49 @@ const ViewNavigation: React.FC<Props> = ({
             imageName += variantDesignator.toLowerCase()
         }
 
-        const apiAddress = `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/${appName}/${variantDesignator}/openapi.json`
+        const variantContainerPath = async () => {
+            const url = await getAppContainerURL(appId, variant.variantId, variant.baseId)
+            setContainerURI(url)
+        }
+        if (!containerURI) {
+            variantContainerPath()
+        }
 
+        const restartContainerHandler = async () => {
+            // Set restarting to true
+            setRestarting(true)
+            try {
+                const response = await restartAppVariantContainer(variant.variantId)
+                if (response.status === 200) {
+                    showNotification({
+                        type: "success",
+                        message: "App Container",
+                        description: `${response.data.message}`,
+                        duration: 5,
+                        key: response.status,
+                    })
+
+                    // Set restarting to false
+                    await waitForAppToStart({appId, variant})
+                    router.reload()
+                    setRestarting(false)
+                }
+            } catch {
+            } finally {
+                setRestarting(false)
+            }
+        }
+
+        const apiAddress = `${containerURI}/openapi.json`
         return (
             <div>
                 {error ? (
                     <div>
                         <p>
-                            Error connecting to the variant {variant.variantName}. {error.message}
+                            Error connecting to the variant {variant.variantName}.{" "}
+                            {(axios.isAxiosError(error) && error.response?.status === 404 && (
+                                <span>Container is not running.</span>
+                            )) || <span>{error.message}</span>}
                         </p>
                         <p>To debug this issue, please follow the steps below:</p>
                         <ul>
@@ -84,13 +186,24 @@ const ViewNavigation: React.FC<Props> = ({
 
                         <Button
                             type="primary"
-                            danger
-                            size="normal"
                             onClick={() => {
-                                setRemovalVariantName(variant.variantName)
-                                setRemovalWarningModalOpen(true)
+                                restartContainerHandler()
                             }}
-                            loading={isDeleteLoading}
+                            disabled={restarting}
+                            loading={restarting}
+                            className={classes.restartBtnMargin}
+                        >
+                            <Tooltip placement="bottom" title="Restart the variant container">
+                                Restart Container
+                            </Tooltip>
+                        </Button>
+
+                        <Button
+                            type="primary"
+                            danger
+                            onClick={() => {
+                                deleteVariant(() => removeVariant(variant.variantId))
+                            }}
                         >
                             <Tooltip placement="bottom" title="Delete the variant permanently">
                                 Delete Variant
@@ -107,25 +220,32 @@ const ViewNavigation: React.FC<Props> = ({
             <Row gutter={[{xs: 8, sm: 16, md: 24, lg: 32}, 20]}>
                 <Col span={24}>
                     <ParametersView
-                        variantName={variant.variantName}
+                        variant={variant}
                         optParams={optParams}
                         isParamSaveLoading={isParamSaveLoading}
                         onOptParamsChange={saveOptParams}
                         handlePersistVariant={handlePersistVariant}
                         isPersistent={variant.persistent} // if the variant persists in the backend, then saveoptparams will need to know to update and not save new variant
-                        setRemovalVariantName={setRemovalVariantName}
-                        setRemovalWarningModalOpen={setRemovalWarningModalOpen}
-                        isDeleteLoading={isDeleteLoading}
+                        deleteVariant={deleteVariant}
                         isParamsCollapsed={isParamsCollapsed}
                         setIsParamsCollapsed={setIsParamsCollapsed}
+                        environments={environments}
+                        onAdd={onAdd}
+                        getHelpers={getHelpers}
+                        onStateChange={onStateChange}
                     />
                 </Col>
             </Row>
             <Divider />
 
-            <Row gutter={[{xs: 8, sm: 16, md: 24, lg: 32}, 20]} style={{marginTop: "20px"}}>
+            <Row gutter={[{xs: 8, sm: 16, md: 24, lg: 32}, 20]} className={classes.row}>
                 <Col span={24}>
-                    <TestView inputParams={inputParams} optParams={optParams} URIPath={URIPath} />
+                    <TestView
+                        inputParams={inputParams}
+                        optParams={optParams}
+                        variant={variant}
+                        isChatVariant={!!isChatVariant}
+                    />
                 </Col>
             </Row>
         </Spin>

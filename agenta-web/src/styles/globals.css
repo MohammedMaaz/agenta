@@ -5,6 +5,23 @@ body {
     text-decoration: none;
 }
 
+.dark-mode {
+    background-color: #141414;
+}
+
+.light-mode {
+    background-color: #ffffff;
+    color: #000;
+
+    .next-error-h1 {
+        border-right: 1px solid #000;
+    }
+}
+
+.evalautionContainer {
+    margin-bottom: 200px;
+}
+
 .mdxSlider img {
     width: 100%;
 }
@@ -56,4 +73,9 @@ body {
     .evalaution-title {
         min-height: 120px;
     }
+}
+
+/* It removes antd tabs transition to fix lag when using type="editable-card" */
+.editable-card.ant-tabs-card > .ant-tabs-nav .ant-tabs-tab {
+    transition: none;
 }

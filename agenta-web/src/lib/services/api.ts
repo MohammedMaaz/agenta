@@ -1,21 +1,44 @@
 import useSWR from "swr"
-import axios from "axios"
-import {parseOpenApiSchema} from "@/lib/helpers/openapi_parser"
-import {Variant, Parameter, EvaluationResponseType, Evaluation, AppTemplate} from "@/lib/Types"
+import axios from "@/lib//helpers/axiosConfig"
+import {
+    detectChatVariantFromOpenAISchema,
+    openAISchemaToParameters,
+} from "@/lib/helpers/openapi_parser"
+import {
+    Variant,
+    Parameter,
+    EvaluationResponseType,
+    Evaluation,
+    AppTemplate,
+    GenericObject,
+    Environment,
+    CreateCustomEvaluation,
+    ExecuteCustomEvalCode,
+    ListAppsItem,
+    AICritiqueCreate,
+    ChatMessage,
+    KeyValuePair,
+} from "@/lib/Types"
 import {
     fromEvaluationResponseToEvaluation,
     fromEvaluationScenarioResponseToEvaluationScenario,
 } from "../transformers"
-import {EvaluationType} from "../enums"
+import {EvaluationFlow, EvaluationType} from "../enums"
+import {delay, removeKeys} from "../helpers/utils"
+import {useProfileData} from "@/contexts/profile.context"
 /**
  * Raw interface for the parameters parsed from the openapi.json
  */
 
-const fetcher = (...args) => fetch(...args).then((res) => res.json())
+const fetcher = (url: string) => axios.get(url).then((res) => res.data)
 
-export async function fetchVariants(app: string): Promise<Variant[]> {
+export async function fetchVariants(
+    appId: string,
+    ignoreAxiosError: boolean = false,
+): Promise<Variant[]> {
     const response = await axios.get(
-        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/app_variant/list_variants/?app_name=${app}`,
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/apps/${appId}/variants/`,
+        {_ignoreError: ignoreAxiosError} as any,
     )
 
     if (response.data && Array.isArray(response.data) && response.data.length > 0) {
@@ -26,12 +49,24 @@ export async function fetchVariants(app: string): Promise<Variant[]> {
                 persistent: true,
                 parameters: variant.parameters,
                 previousVariantName: variant.previous_variant_name || null,
+                variantId: variant.variant_id,
+                baseId: variant.base_id,
+                baseName: variant.base_name,
+                configId: variant.config_id,
+                configName: variant.config_name,
             }
             return v
         })
     }
 
     return []
+}
+
+export function restartAppVariantContainer(variantId: string) {
+    return axios.post(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/containers/restart_container/`,
+        {variant_id: variantId},
+    )
 }
 
 /**
@@ -42,20 +77,18 @@ export async function fetchVariants(app: string): Promise<Variant[]> {
  * @param URIPath
  * @returns
  */
-export function callVariant(
-    inputParametersDict: Record<string, string>,
+export async function callVariant(
+    inputParametersDict: KeyValuePair,
     inputParamDefinition: Parameter[],
     optionalParameters: Parameter[],
-    URIPath: string,
+    appId: string,
+    baseId: string,
+    chatMessages?: ChatMessage[],
 ) {
-    console.log("inputParametersDict", inputParametersDict)
+    const isChatVariant = Array.isArray(chatMessages) && chatMessages.length > 0
     // Separate input parameters into two dictionaries based on the 'input' property
     const mainInputParams: Record<string, string> = {} // Parameters with input = true
     const secondaryInputParams: Record<string, string> = {} // Parameters with input = false
-    const inputParams = Object.keys(inputParametersDict).reduce((acc: any, key) => {
-        acc[key] = inputParametersDict[key]
-        return acc
-    }, {})
     for (let key of Object.keys(inputParametersDict)) {
         const paramDefinition = inputParamDefinition.find((param) => param.name === key)
 
@@ -72,41 +105,24 @@ export function callVariant(
 
     const optParams = optionalParameters
         .filter((param) => param.default)
-        .filter((param) => param.type !== "object") // remove dics from optional parameters
+        .filter((param) => param.type !== "object") // remove dicts from optional parameters
         .reduce((acc: any, param) => {
             acc[param.name] = param.default
             return acc
         }, {})
     const requestBody = {
-        ["inputs"]: secondaryInputParams,
         ...mainInputParams,
         ...optParams,
+        ["inputs"]: isChatVariant
+            ? chatMessages.filter((item) => item.content).map((item) => removeKeys(item, ["id"]))
+            : secondaryInputParams,
     }
 
-    return axios
-        .post(`${process.env.NEXT_PUBLIC_AGENTA_API_URL}/${URIPath}/generate`, requestBody, {
-            headers: {
-                accept: "application/json",
-                "Content-Type": "application/json",
-            },
-        })
-        .then((res) => {
-            return res.data
-        })
-        .catch((error) => {
-            if (error.response && error.response.status === 500) {
-                throw new Error(error.response.data.error + " " + error.response.data.traceback, {
-                    cause: error.response.data.error,
-                })
-            }
-            if (error.response && error.response.status === 422) {
-                let cause = `Unprocessable Entity: The server understands the content type of the request, and the syntax of the request is correct, but it was unable to process the contained instructions.`
-                throw new Error(`${cause} Data: ${JSON.stringify(error.response.data, null, 2)}`, {
-                    cause,
-                })
-            }
-            throw error // If it's not a 500 status, or if error.response is undefined, rethrow the error so it can be handled elsewhere.
-        })
+    const appContainerURI = await getAppContainerURL(appId, undefined, baseId)
+
+    return axios.post(`${appContainerURI}/generate`, requestBody).then((res) => {
+        return res.data
+    })
 }
 
 /**
@@ -115,33 +131,88 @@ export function callVariant(
  * @param variantName
  * @returns
  */
-export const getVariantParametersFromOpenAPI = async (app: string, variant: Variant) => {
-    try {
-        const sourceName = variant.templateVariantName
-            ? variant.templateVariantName
-            : variant.variantName
-        const url = `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/${app}/${sourceName}/openapi.json`
-        const response = await axios.get(url)
-        let APIParams = parseOpenApiSchema(response.data)
-        // we create a new param for DictInput that will contain the name of the inputs
-        APIParams = APIParams.map((param) => {
-            console.log("param", param)
-            if (param.type === "object") {
-                // if param.default is defined
-                if (param?.default) {
-                    param.default = param.default.map((item: string) => {
-                        return {name: item}
-                    })
-                } else {
-                    param.default = []
-                }
+export const getVariantParametersFromOpenAPI = async (
+    appId: string,
+    variantId?: string,
+    baseId?: string,
+    ignoreAxiosError: boolean = false,
+) => {
+    const appContainerURI = await getAppContainerURL(appId, variantId, baseId)
+    const url = `${appContainerURI}/openapi.json`
+    const response = await axios.get(url, {_ignoreError: ignoreAxiosError} as any)
+    const isChatVariant = detectChatVariantFromOpenAISchema(response.data)
+    let APIParams = openAISchemaToParameters(response.data)
+    // we create a new param for DictInput that will contain the name of the inputs
+    APIParams = APIParams.map((param) => {
+        if (param.type === "object") {
+            // if param.default is defined
+            if (param?.default) {
+                param.default = param.default.map((item: string) => {
+                    return {name: item}
+                })
+            } else {
+                param.default = []
             }
-            return param
-        })
-        const initOptParams = APIParams.filter((param) => !param.input) // contains the default values too!
-        const inputParams = APIParams.filter((param) => param.input) // don't have input values
-        return {initOptParams, inputParams}
+        }
+        return param
+    })
+    if (isChatVariant) APIParams = APIParams.filter((param) => param.name !== "inputs")
+    const initOptParams = APIParams.filter((param) => !param.input) // contains the default values too!
+    const inputParams = APIParams.filter((param) => param.input) // don't have input values
+    return {
+        initOptParams,
+        inputParams,
+        isChatVariant,
+    }
+}
+
+// Define a type for our cache
+interface Cache {
+    [key: string]: string
+}
+
+// Create the cache object
+const urlCache: Cache = {}
+
+/**
+ * Retries the container url for an app
+ * @param {string} appId - The id of the app
+ * @param {string} variantId - The id of the variant
+ * @returns {Promise<string>} - Returns the URL path or an empty string
+ * @throws {Error} - Throws an error if the request fails
+ */
+export const getAppContainerURL = async (
+    appId: string,
+    variantId?: string,
+    baseId?: string,
+): Promise<string> => {
+    try {
+        // Null-check for the environment variable
+        if (!process.env.NEXT_PUBLIC_AGENTA_API_URL) {
+            throw new Error("Environment variable NEXT_PUBLIC_AGENTA_API_URL is not set.")
+        }
+
+        let cacheKey = appId
+        if (variantId) cacheKey += `_${variantId}`
+        if (baseId) cacheKey += `_${baseId}`
+
+        // Check if the URL is already cached
+        if (urlCache[cacheKey]) {
+            return urlCache[cacheKey]
+        }
+
+        // Retrieve container URL from backend
+        const url = `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/containers/container_url/`
+        const response = await axios.get(url, {params: {variant_id: variantId, base_id: baseId}})
+        if (response.status === 200 && response.data && response.data.uri) {
+            // Cache the URL before returning
+            urlCache[cacheKey] = response.data.uri
+            return response.data.uri
+        } else {
+            return ""
+        }
     } catch (error) {
+        // Forward the error so it can be handled by the calling function
         throw error
     }
 }
@@ -149,326 +220,486 @@ export const getVariantParametersFromOpenAPI = async (app: string, variant: Vari
 /**
  * Saves a new variant to the database based on previous
  */
-export async function saveNewVariant(appName: string, variant: Variant, parameters: Parameter[]) {
-    const appVariant = {
-        app_name: appName,
-        variant_name: variant.templateVariantName,
-    }
-    try {
-        const response = await axios.post(
-            `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/app_variant/add/from_previous/`,
-            {
-                previous_app_variant: appVariant,
-                new_variant_name: variant.variantName,
-                parameters: parameters.reduce((acc, param) => {
-                    return {...acc, [param.name]: param.default}
-                }, {}),
-            },
-        )
-
-        // You can use the response here if needed
-    } catch (error) {
-        console.error(error)
-        // Handle error here
-        throw error
-    }
-}
-
-export async function updateVariantParams(
-    appName: string,
-    variant: Variant,
+export async function saveNewVariant(
+    baseId: string,
+    newVariantName: string,
+    newConfigName: string,
     parameters: Parameter[],
 ) {
-    try {
-        const response = await axios.put(
-            `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/app_variant/update_variant_parameters/`,
-            {
-                app_name: appName,
-                variant_name: variant.variantName,
-                parameters: parameters.reduce((acc, param) => {
-                    return {...acc, [param.name]: param.default}
-                }, {}),
-            },
-        )
-    } catch (error) {
-        console.error(error)
-        throw error
-    }
+    await axios.post(`${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/variants/from-base/`, {
+        base_id: baseId,
+        new_variant_name: newVariantName,
+        new_config_name: newConfigName,
+        parameters: parameters.reduce((acc, param) => {
+            return {...acc, [param.name]: param.default}
+        }, {}),
+    })
 }
 
-export async function removeApp(appName: string) {
-    try {
-        await axios.delete(
-            `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/app_variant/remove_app/`,
-            {data: {app_name: appName}},
-        )
-        console.log("App removed: " + appName)
-    } catch (error) {
-        console.error("Error removing " + appName + " " + error)
-        throw error
-    }
+export async function updateVariantParams(variantId: string, parameters: Parameter[]) {
+    await axios.put(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/variants/${variantId}/parameters/`,
+        {
+            parameters: parameters.reduce((acc, param) => {
+                return {...acc, [param.name]: param.default}
+            }, {}),
+        },
+    )
 }
 
-export async function removeVariant(appName: string, variantName: string) {
-    try {
-        await axios.delete(
-            `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/app_variant/remove_variant/`,
-            {data: {app_name: appName, variant_name: variantName}},
-        )
-        console.log("Variant removed: " + variantName)
-    } catch (error) {
-        console.error("Error removing " + variantName + " " + error)
-        throw error
-    }
+export async function removeApp(appId: string) {
+    await axios.delete(`${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/apps/${appId}/`, {
+        data: {app_id: appId},
+    })
 }
+
+export async function removeVariant(variantId: string) {
+    await axios.delete(`${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/variants/${variantId}/`)
+}
+
 /**
  * Loads the list of testsets
  * @returns
  */
-export const useLoadTestsetsList = (app_name: string) => {
-    const {data, error, mutate} = useSWR(
-        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/testsets?app_name=${app_name}`,
+export const useLoadTestsetsList = (appId: string) => {
+    const {data, error, mutate, isLoading} = useSWR(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/testsets/?app_id=${appId}`,
         fetcher,
         {revalidateOnFocus: false},
     )
+
     return {
-        testsets: data,
-        isTestsetsLoading: !error && !data,
+        testsets: data || [],
+        isTestsetsLoading: isLoading,
         isTestsetsLoadingError: error,
         mutate,
     }
 }
 
-export async function createNewTestset(appName: string, testsetName: string, testsetData: any) {
-    try {
-        const response = await axios.post(
-            `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/testsets/${appName}`,
-            {
-                name: testsetName,
-                csvdata: testsetData,
-            },
-        )
-        return response
-    } catch (error) {
-        console.error(error)
-        throw error
-    }
+export async function createNewTestset(appId: string, testsetName: string, testsetData: any) {
+    const response = await axios.post(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/testsets/${appId}/`,
+        {
+            name: testsetName,
+            csvdata: testsetData,
+        },
+    )
+    return response
 }
 
 export async function updateTestset(testsetId: String, testsetName: string, testsetData: any) {
-    try {
-        const response = await axios.put(
-            `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/testsets/${testsetId}`,
-            {
-                name: testsetName,
-                csvdata: testsetData,
-            },
-        )
-        return response
-    } catch (error) {
-        console.error(error)
-        throw error
-    }
+    const response = await axios.put(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/testsets/${testsetId}/`,
+        {
+            name: testsetName,
+            csvdata: testsetData,
+        },
+    )
+    return response
 }
 
 export const loadTestset = async (testsetId: string) => {
-    return fetch(`${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/testsets/${testsetId}`, {
-        headers: {
-            "Content-Type": "application/json",
-        },
-    })
-        .then((res) => res.json())
-        .then((data) => {
-            return data
-        })
-        .catch((err) => {
-            console.error(err)
-        })
+    const response = await axios.get(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/testsets/${testsetId}/`,
+    )
+    return response.data
 }
 
 export const deleteTestsets = async (ids: string[]) => {
-    try {
-        const response = await axios({
-            method: "delete",
-            url: `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/testsets`,
-            data: {testset_ids: ids},
-        })
-        if (response.status === 200) {
-            return response.data
-        }
-    } catch (error) {
-        console.error(`Error deleting entity: ${error}`)
-        throw error
-    }
+    const response = await axios({
+        method: "delete",
+        url: `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/testsets/`,
+        data: {testset_ids: ids},
+    })
+    return response.data
 }
 
-const eval_endpoint = axios.create({
-    baseURL: `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations`,
-})
-
-export const loadEvaluations = async (app_name: string) => {
-    try {
-        return await eval_endpoint.get(`?app_name=${app_name}`).then((responseData) => {
+export const loadEvaluations = async (appId: string) => {
+    return await axios
+        .get(`${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/?app_id=${appId}`)
+        .then((responseData) => {
             const evaluations = responseData.data.map((item: EvaluationResponseType) => {
                 return fromEvaluationResponseToEvaluation(item)
             })
 
             return evaluations
         })
-    } catch (error) {
-        console.error(error)
-        throw error
-    }
 }
 
 export const loadEvaluation = async (evaluationId: string) => {
-    try {
-        return await eval_endpoint.get(evaluationId).then((responseData) => {
+    return await axios
+        .get(`${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/${evaluationId}/`)
+        .then((responseData) => {
             return fromEvaluationResponseToEvaluation(responseData.data)
         })
-    } catch (error) {
-        console.error(error)
-        throw error
-    }
 }
 
 export const deleteEvaluations = async (ids: string[]) => {
-    try {
-        const response = await axios({
-            method: "delete",
-            url: `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations`,
-            data: {evaluations_ids: ids},
-        })
-        if (response.status === 200) {
-            return response.data
-        }
-    } catch (error) {
-        console.error(`Error deleting entity: ${error}`)
-        throw error
-    }
+    const response = await axios({
+        method: "delete",
+        url: `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/`,
+        data: {evaluations_ids: ids},
+    })
+    return response.data
 }
 
 export const loadEvaluationsScenarios = async (
     evaluationTableId: string,
     evaluation: Evaluation,
 ) => {
-    try {
-        return await eval_endpoint
-            .get(`${evaluationTableId}/evaluation_scenarios`)
-            .then((responseData) => {
-                const evaluationsRows = responseData.data.map((item: any) => {
-                    return fromEvaluationScenarioResponseToEvaluationScenario(item, evaluation)
-                })
-
-                return evaluationsRows
+    return await axios
+        .get(
+            `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/${evaluationTableId}/evaluation_scenarios/`,
+        )
+        .then((responseData) => {
+            const evaluationsRows = responseData.data.map((item: any) => {
+                return fromEvaluationScenarioResponseToEvaluationScenario(item, evaluation)
             })
-    } catch (error) {
-        console.error(error)
-        throw error
-    }
+
+            return evaluationsRows
+        })
 }
 
-export const updateEvaluation = async (evaluationId: string, data) => {
-    const response = await eval_endpoint.put(`${evaluationId}`, data)
+export const createNewEvaluation = async (
+    {
+        variant_ids,
+        appId,
+        evaluationType,
+        evaluationTypeSettings,
+        inputs,
+        llmAppPromptTemplate,
+        selectedCustomEvaluationID,
+        testsetId,
+    }: {
+        variant_ids: string[]
+        appId: string
+        evaluationType: string
+        evaluationTypeSettings: Partial<EvaluationResponseType["evaluation_type_settings"]>
+        inputs: string[]
+        llmAppPromptTemplate?: string
+        selectedCustomEvaluationID?: string
+        testsetId: string
+    },
+    ignoreAxiosError: boolean = false,
+) => {
+    const data = {
+        variant_ids,
+        app_id: appId,
+        inputs: inputs,
+        evaluation_type: evaluationType,
+        evaluation_type_settings: {
+            ...evaluationTypeSettings,
+            custom_code_evaluation_id: selectedCustomEvaluationID,
+            llm_app_prompt_template: llmAppPromptTemplate,
+        },
+        testset_id: testsetId,
+        status: EvaluationFlow.EVALUATION_INITIALIZED,
+    }
+
+    const response = await axios.post(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/`,
+        data,
+        {_ignoreError: ignoreAxiosError} as any,
+    )
+    return response.data.id
+}
+
+export const updateEvaluation = async (evaluationId: string, data: GenericObject) => {
+    const response = await axios.put(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/${evaluationId}/`,
+        data,
+    )
     return response.data
 }
 
 export const updateEvaluationScenario = async (
     evaluationTableId: string,
     evaluationScenarioId: string,
-    data,
+    data: GenericObject,
     evaluationType: EvaluationType,
 ) => {
-    const response = await eval_endpoint.put(
-        `${evaluationTableId}/evaluation_scenario/${evaluationScenarioId}/${evaluationType}`,
+    const response = await axios.put(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/${evaluationTableId}/evaluation_scenario/${evaluationScenarioId}/${evaluationType}/`,
         data,
     )
     return response.data
 }
 
-export const postEvaluationScenario = async (evaluationTableId: string, data) => {
-    const response = await eval_endpoint.post(`${evaluationTableId}/evaluation_scenario`, data)
+export const postEvaluationScenario = async (evaluationTableId: string, data: GenericObject) => {
+    const response = await axios.post(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/${evaluationTableId}/evaluation_scenario/`,
+        data,
+    )
     return response.data
+}
+
+export const evaluateAICritiqueForEvalScenario = async (
+    data: AICritiqueCreate,
+    ignoreAxiosError: boolean = false,
+) => {
+    const response = await axios.post(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/evaluation_scenario/ai_critique/`,
+        data,
+        {_ignoreError: ignoreAxiosError} as any,
+    )
+    return response
 }
 
 export const fetchEvaluationResults = async (evaluationId: string) => {
-    try {
-        const response = await fetch(
-            `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/${evaluationId}/results`,
-        )
-        if (response.ok) {
-            const data = await response.json()
-            return data
-        } else {
-            throw new Error("Failed to fetch results.")
-        }
-    } catch (error) {
-        console.error("Error fetching results:", error)
-        throw error
+    const response = await axios.get(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/${evaluationId}/results/`,
+    )
+    return response.data
+}
+
+export const fetchEvaluationScenarioResults = async (evaluation_scenario_id: string) => {
+    const response = await axios.get(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/evaluation_scenario/${evaluation_scenario_id}/score/`,
+    )
+    return response
+}
+
+export const saveCustomCodeEvaluation = async (
+    payload: CreateCustomEvaluation,
+    ignoreAxiosError: boolean = false,
+) => {
+    const response = await axios.post(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/custom_evaluation/`,
+        payload,
+        {_ignoreError: ignoreAxiosError} as any,
+    )
+    return response
+}
+
+export const editCustomEvaluationDetail = async (
+    id: string,
+    payload: CreateCustomEvaluation,
+    ignoreAxiosError: boolean = false,
+) => {
+    const response = await axios.put(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/custom_evaluation/${id}`,
+        payload,
+        {_ignoreError: ignoreAxiosError} as any,
+    )
+    return response
+}
+
+export const fetchCustomEvaluations = async (app_id: string, ignoreAxiosError: boolean = false) => {
+    const response = await axios.get(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/custom_evaluation/list/${app_id}/`,
+        {_ignoreError: ignoreAxiosError} as any,
+    )
+    return response
+}
+
+export const fetchCustomEvaluationDetail = async (
+    id: string,
+    ignoreAxiosError: boolean = false,
+) => {
+    const response = await axios.get(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/custom_evaluation/${id}/`,
+        {_ignoreError: ignoreAxiosError} as any,
+    )
+    return response.data
+}
+
+export const fetchCustomEvaluationNames = async (
+    app_id: string,
+    ignoreAxiosError: boolean = false,
+) => {
+    const response = await axios.get(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/custom_evaluation/${app_id}/names/`,
+        {_ignoreError: ignoreAxiosError} as any,
+    )
+    return response
+}
+
+export const executeCustomEvaluationCode = async (
+    payload: ExecuteCustomEvalCode,
+    ignoreAxiosError: boolean = false,
+) => {
+    const response = await axios.post(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/custom_evaluation/execute/${payload.evaluation_id}/`,
+        payload,
+        {_ignoreError: ignoreAxiosError} as any,
+    )
+    return response
+}
+
+export const updateEvaluationScenarioScore = async (
+    evaluation_scenario_id: string,
+    score: number,
+    ignoreAxiosError: boolean = false,
+) => {
+    const response = await axios.put(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/evaluations/evaluation_scenario/${evaluation_scenario_id}/score/`,
+        {score},
+        {_ignoreError: ignoreAxiosError} as any,
+    )
+    return response
+}
+
+export const useApps = () => {
+    const {selectedOrg} = useProfileData()
+    const {data, error, isLoading, mutate} = useSWR(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/apps/?org_id=${selectedOrg?.id}`,
+        selectedOrg?.id ? fetcher : () => {}, //doon't fetch if org is not selected
+    )
+
+    return {
+        data: (data || []) as ListAppsItem[],
+        error,
+        isLoading: selectedOrg?.id ? isLoading : true,
+        mutate,
     }
 }
 
-export const fetchApps = () => {
-    const {data, error, isLoading} = useSWR(
-        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/app_variant/list_apps/`,
-        fetcher,
-    )
-    return {
-        data,
-        error,
-        isLoading,
-    }
+export const getProfile = async (ignoreAxiosError: boolean = false) => {
+    return axios.get(`${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/profile/`, {
+        _ignoreError: ignoreAxiosError,
+    } as any)
+}
+
+export const getOrgsList = async (ignoreAxiosError: boolean = false) => {
+    return axios.get(`${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/organizations/`, {
+        _ignoreError: ignoreAxiosError,
+    } as any)
 }
 
 export const getTemplates = async () => {
-    return fetch(`${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/containers/templates/`, {
-        headers: {
-            "Content-Type": "application/json",
-        },
-    })
-        .then((response) => response.json())
-        .then((data) => {
-            return data
-        })
-        .catch((error) => {
-            console.error("Error fetching templates:", error)
-        })
-}
-
-export const pullTemplateImage = async (image_name: string) => {
-    return fetch(
-        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/containers/templates/${image_name}/images/`,
-        {
-            headers: {
-                "Content-Type": "application/json",
-            },
-        },
+    const response = await axios.get(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/containers/templates/`,
     )
-        .then((response) => response.json())
-        .then((data) => {
-            return data
-        })
-        .catch((error) => {
-            console.error("Error fetching template image:", error)
-            throw error
-        })
+    return response.data
 }
 
-export const startTemplate = async (templateObj: AppTemplate) => {
-    try {
-        const response = await axios.post(
-            `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/app_variant/add/from_template/`,
-            templateObj,
-            {
-                headers: {
-                    accept: "application/json",
-                    "Content-Type": "application/json",
-                },
-            },
-        )
-        return response
-    } catch (error) {
-        console.error("Start Template Error => ", error)
-        throw error
+export const createAppFromTemplate = async (
+    templateObj: AppTemplate,
+    ignoreAxiosError: boolean = false,
+) => {
+    const response = await axios.post(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/apps/app_and_variant_from_template/`,
+        templateObj,
+        {_ignoreError: ignoreAxiosError} as any,
+    )
+    return response
+}
+
+export const fetchData = async (url: string): Promise<any> => {
+    const response = await fetch(url)
+    return response.json()
+}
+
+export const waitForAppToStart = async ({
+    appId,
+    variant,
+    timeout = 20000,
+    interval = 2000,
+}: {
+    appId: string
+    variant?: Variant
+    timeout?: number
+    interval?: number
+}) => {
+    const _variant = variant || (await fetchVariants(appId, true))[0]
+    if (_variant) {
+        const shortPoll = async () => {
+            let started = false
+            while (!started) {
+                try {
+                    await getVariantParametersFromOpenAPI(
+                        appId,
+                        _variant.variantId,
+                        _variant.baseId,
+                        true,
+                    )
+                    started = true
+                } catch {}
+                await delay(interval)
+            }
+        }
+        await Promise.race([
+            shortPoll(),
+            new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), timeout)),
+        ])
     }
+}
+
+export const createAndStartTemplate = async ({
+    appName,
+    openAIKey,
+    templateId,
+    orgId,
+    timeout,
+    onStatusChange,
+}: {
+    appName: string
+    openAIKey: string
+    templateId: string
+    orgId: string
+    timeout?: number
+    onStatusChange?: (
+        status: "creating_app" | "starting_app" | "success" | "bad_request" | "timeout" | "error",
+        details?: any,
+        appId?: string,
+    ) => void
+}) => {
+    try {
+        onStatusChange?.("creating_app")
+        let app
+        try {
+            app = await createAppFromTemplate(
+                {
+                    app_name: appName,
+                    template_id: templateId,
+                    env_vars: {
+                        OPENAI_API_KEY: openAIKey,
+                    },
+                    organization_id: orgId,
+                },
+                true,
+            )
+        } catch (error: any) {
+            if (error?.response?.status === 400) {
+                onStatusChange?.("bad_request", error)
+                return
+            }
+            throw error
+        }
+
+        onStatusChange?.("starting_app", "", app?.data?.app_id)
+        try {
+            await waitForAppToStart({appId: app?.data?.app_id, timeout})
+        } catch (error: any) {
+            if (error.message === "timeout") {
+                onStatusChange?.("timeout", "", app?.data?.app_id)
+                return
+            }
+            throw error
+        }
+
+        onStatusChange?.("success", "", app?.data?.app_id)
+    } catch (error) {
+        onStatusChange?.("error", error)
+    }
+}
+
+export const fetchEnvironments = async (appId: string): Promise<Environment[]> => {
+    const response = await fetch(
+        `${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/apps/${appId}/environments/`,
+    )
+
+    if (response.status !== 200) {
+        throw new Error("Failed to fetch environments")
+    }
+
+    const data: Environment[] = await response.json()
+    return data
+}
+
+export const publishVariant = async (variantId: string, environmentName: string) => {
+    await axios.post(`${process.env.NEXT_PUBLIC_AGENTA_API_URL}/api/environments/deploy/`, {
+        environment_name: environmentName,
+        variant_id: variantId,
+    })
 }

@@ -1,9 +1,19 @@
 [tool.poetry]
 name = "agenta"
-version = "0.2.0"
-description = "Code for the SDK and CLI for the Agenta Lab platform"
-authors = ["Mahmoud Mabrouk <mahmoudmabrouk.mail@gmail.com>"]
+version = "0.5.7"
+description = "The SDK for agenta is an open-source LLMOps platform."
 readme = "README.md"
+authors = ["Mahmoud Mabrouk <mahmoud@agenta.ai>"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.9",
+    "Topic :: Software Development :: Libraries"
+]
+homepage = "https://agenta.ai"
+repository = "https://github.com/agenta-ai/agenta"
+documentation = "https://docs.agenta.ai"
+keywords = ["LLMOps", "LLM", "evaluation", "prompt engineering"]
 
 [tool.poetry.dependencies]
 python = "^3.9"
@@ -16,6 +26,7 @@ ipdb = "^0.13.13"
 python-dotenv = "^1.0.0"
 python-multipart = "^0.0.6"
 importlib-metadata = "^6.7.0"
+posthog = "^3.0.2"
 
 [tool.poetry.dev-dependencies]
 pytest = "^6.2"

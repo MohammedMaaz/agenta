@@ -1,5 +1,10 @@
 import AppSelector from "@/components/AppSelector/AppSelector"
+import ProtectedRoute from "@/components/ProtectedRoute/ProtectedRoute"
 
 export default function Apps() {
-    return <AppSelector />
+    return (
+        <ProtectedRoute>
+            <AppSelector />
+        </ProtectedRoute>
+    )
 }

@@ -1,37 +1,66 @@
 import {PropsWithChildren, createContext, useState, useContext, useEffect} from "react"
+import {useLocalStorage, useUpdateEffect} from "usehooks-ts"
+
+export enum ThemeMode {
+    Light = "light",
+    Dark = "dark",
+    System = "system",
+}
+type ThemeType = ThemeMode.Light | ThemeMode.Dark
+type ThemeModeType = `${ThemeMode}`
 
 export const ThemeContext = createContext<{
-    appTheme: string
-    toggleAppTheme: () => void
+    appTheme: ThemeType
+    themeMode: ThemeMode
+    toggleAppTheme: (themeName: ThemeModeType) => void
 }>({
-    appTheme: "light",
+    appTheme: ThemeMode.Light,
+    themeMode: ThemeMode.Light,
     toggleAppTheme: () => {},
 })
 
 export const useAppTheme = () => useContext(ThemeContext)
 
+const getDeviceTheme = () => {
+    return window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? ThemeMode.Dark
+        : ThemeMode.Light
+}
+
+const getAppTheme = (themeMode: ThemeMode) =>
+    themeMode === ThemeMode.System ? getDeviceTheme() : themeMode
+
 const ThemeContextProvider: React.FC<PropsWithChildren> = ({children}) => {
-    const [appTheme, setAppTheme] = useState<string | null>(null)
-
-    const getDeviceTheme = (): string => {
-        return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"
-    }
+    const [themeMode, setThemeMode] = useLocalStorage<ThemeMode>("agenta-theme", ThemeMode.Light)
+    const [appTheme, setAppTheme] = useState<ThemeType>(getAppTheme(themeMode))
 
     useEffect(() => {
-        const savedTheme = localStorage.getItem("agenta-theme")
-        setAppTheme(savedTheme || getDeviceTheme())
-    }, [])
+        const handleSystemThemeChange = ({matches}: MediaQueryListEvent) => {
+            if (themeMode === ThemeMode.System) {
+                setAppTheme(matches ? ThemeMode.Dark : ThemeMode.Light)
+            }
+        }
 
-    useEffect(() => {
-        if (appTheme) localStorage.setItem("agenta-theme", appTheme)
-    }, [appTheme])
+        const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)")
+        mediaQuery.addEventListener("change", handleSystemThemeChange)
 
-    const toggleAppTheme = () => {
-        setAppTheme((prevTheme) => (prevTheme === "dark" ? "light" : "dark"))
-    }
+        return () => {
+            mediaQuery.removeEventListener("change", handleSystemThemeChange)
+        }
+    }, [themeMode])
+
+    useUpdateEffect(() => {
+        setAppTheme(getAppTheme(themeMode))
+    }, [themeMode])
 
     return (
-        <ThemeContext.Provider value={{appTheme: appTheme || "light", toggleAppTheme}}>
+        <ThemeContext.Provider
+            value={{
+                appTheme: appTheme || ThemeMode.Light,
+                toggleAppTheme: (themeType) => setThemeMode(themeType as ThemeMode),
+                themeMode,
+            }}
+        >
             {children}
         </ThemeContext.Provider>
     )

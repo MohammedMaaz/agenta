@@ -1,6 +1,6 @@
 import {useState, useEffect} from "react"
 import type {ColumnType} from "antd/es/table"
-import {BarChartOutlined, LineChartOutlined} from "@ant-design/icons"
+import {LineChartOutlined} from "@ant-design/icons"
 import {
     Button,
     Card,
@@ -15,18 +15,25 @@ import {
     Typography,
     message,
 } from "antd"
-import {Evaluation, Variant} from "@/lib/Types"
+import {Evaluation} from "@/lib/Types"
 import {
     updateEvaluationScenario,
     callVariant,
     fetchEvaluationResults,
     updateEvaluation,
+    evaluateAICritiqueForEvalScenario,
 } from "@/lib/services/api"
-import {useVariant} from "@/lib/hooks/useVariant"
+import {useVariants} from "@/lib/hooks/useVariant"
 import {useRouter} from "next/router"
-import {EvaluationFlow} from "@/lib/enums"
-import TextArea from "antd/es/input/TextArea"
+import {EvaluationFlow, EvaluationType} from "@/lib/enums"
 import {getOpenAIKey} from "@/lib/helpers/utils"
+import {createUseStyles} from "react-jss"
+import {exportAICritiqueEvaluationData} from "@/lib/helpers/evaluate"
+import SecondaryButton from "../SecondaryButton/SecondaryButton"
+import {useAppTheme} from "../Layout/ThemeContextProvider"
+import {testsetRowToChatMessages} from "@/lib/helpers/testset"
+
+const {Title} = Typography
 
 interface AICritiqueEvaluationTableProps {
     evaluation: Evaluation
@@ -41,13 +48,17 @@ interface AICritiqueEvaluationTableRow {
         input_value: string
     }[]
     outputs: {
-        variant_name: string
+        variant_id: string
         variant_output: string
     }[]
     columnData0: string
     correctAnswer: string
-    evaluation: string
+    score: string
     evaluationFlow: EvaluationFlow
+}
+
+type StyleProps = {
+    themeMode: "dark" | "light"
 }
 /**
  *
@@ -57,37 +68,98 @@ interface AICritiqueEvaluationTableRow {
  * @returns
  */
 
+const useStyles = createUseStyles({
+    appVariant: {
+        backgroundColor: "rgb(201 255 216)",
+        color: "rgb(0 0 0)",
+        padding: 4,
+        borderRadius: 5,
+    },
+    inputTestContainer: {
+        display: "flex",
+        justifyContent: "space-between",
+    },
+    inputTest: {
+        backgroundColor: "rgb(201 255 216)",
+        color: "rgb(0 0 0)",
+        padding: 4,
+        borderRadius: 5,
+    },
+    recordInput: {
+        marginBottom: 10,
+    },
+    tag: {
+        fontSize: "14px",
+    },
+    card: ({themeMode}: StyleProps) => ({
+        marginTop: 16,
+        width: "100%",
+        border: "1px solid #ccc",
+        marginRight: "24px",
+        marginBottom: 30,
+        background: themeMode === "light" ? "rgb(246 253 245)" : "#000000",
+        "& .ant-card-head": {
+            minHeight: 44,
+            padding: "0px 12px",
+        },
+        "& .ant-card-body": {
+            padding: "4px 16px",
+            border: "0px solid #ccc",
+        },
+    }),
+    cardTextarea: {
+        height: 120,
+        padding: "0px 0px",
+    },
+    row: {marginBottom: 20},
+    evaluationResult: ({themeMode}: StyleProps) => ({
+        padding: "30px 10px",
+        marginBottom: 20,
+        border: "1px solid #ccc",
+        background: themeMode === "light" ? "rgb(244 244 244)" : "#000000",
+        color: themeMode === "light" ? "#000" : "#fff",
+        borderRadius: 5,
+    }),
+    h3: {
+        marginTop: 0,
+    },
+    resultDataRow: {
+        maxWidth: "100%",
+        overflowX: "auto",
+        whiteSpace: "nowrap",
+    },
+    resultDataCol: {
+        display: "inline-block",
+    },
+    resultDataCard: {
+        width: 200,
+        margin: "0 4px",
+    },
+    stat: {
+        "& .ant-statistic-content-value": {
+            color: "#3f8600",
+        },
+    },
+})
+
 const AICritiqueEvaluationTable: React.FC<AICritiqueEvaluationTableProps> = ({
     evaluation,
     evaluationScenarios,
     columnsCount,
 }) => {
+    const {appTheme} = useAppTheme()
+    const classes = useStyles({themeMode: appTheme} as StyleProps)
     const router = useRouter()
-    const appName = Array.isArray(router.query.app_name)
-        ? router.query.app_name[0]
-        : router.query.app_name || ""
+    const appId = router.query.app_id as string
 
     const variants = evaluation.variants
 
-    const variantData = variants.map((variant: Variant) => {
-        const {inputParams, optParams, URIPath, isLoading, isError, error} = useVariant(
-            appName,
-            variant,
-        )
-
-        return {
-            inputParams,
-            optParams,
-            URIPath,
-            isLoading,
-            isError,
-            error,
-        }
-    })
+    const variantData = useVariants(appId, variants)
 
     const [rows, setRows] = useState<AICritiqueEvaluationTableRow[]>([])
-    const [evaluationPromptTemplate, setEvaluationPromptTemplate] =
-        useState<string>(`We have an LLM App that we want to evaluate its outputs.
+    const [evaluationPromptTemplate, setEvaluationPromptTemplate] = useState<string>(
+        evaluation.evaluationTypeSettings.evaluationPromptTemplate ||
+            `We have an LLM App that we want to evaluate its outputs.
 Based on the prompt and the parameters provided below evaluate the output based on the evaluation strategy below:
 
 Evaluation strategy: 0 to 10 0 is very bad and 10 is very good.
@@ -98,7 +170,8 @@ Correct Answer:{correct_answer}
 Evaluate this: {app_variant_output}
 
 Answer ONLY with one of the given grading or evaluation options.
-`)
+`,
+    )
 
     const [shouldFetchResults, setShouldFetchResults] = useState(false)
     const [evaluationStatus, setEvaluationStatus] = useState<EvaluationFlow>(evaluation.status)
@@ -125,12 +198,17 @@ Answer ONLY with one of the given grading or evaluation options.
     }, [evaluationScenarios])
 
     useEffect(() => {
-        if (evaluationStatus === EvaluationFlow.EVALUATION_FINISHED) {
+        if (evaluationStatus === EvaluationFlow.EVALUATION_FINISHED && shouldFetchResults) {
             fetchEvaluationResults(evaluation.id)
                 .then((data) => setEvaluationResults(data))
                 .catch((err) => console.error("Failed to fetch results:", err))
                 .then(() => {
-                    updateEvaluation(evaluation.id, {status: EvaluationFlow.EVALUATION_FINISHED})
+                    updateEvaluation(evaluation.id, {
+                        status: EvaluationFlow.EVALUATION_FINISHED,
+                        evaluation_type_settings: {
+                            evaluation_prompt_template: evaluationPromptTemplate,
+                        },
+                    })
                 })
                 .catch((err) => console.error("Failed to fetch results:", err))
         }
@@ -138,7 +216,7 @@ Answer ONLY with one of the given grading or evaluation options.
 
     const handleInputChange = (
         e: React.ChangeEvent<HTMLInputElement>,
-        rowIndex: number,
+        rowIndex: any,
         inputFieldKey: number,
     ) => {
         const newRows = [...rows]
@@ -154,6 +232,7 @@ Answer ONLY with one of the given grading or evaluation options.
             console.log("All evaluations finished.")
         } catch (err) {
             console.error("An error occurred:", err)
+            setEvaluationStatus(EvaluationFlow.EVALUATION_FAILED)
         }
     }
 
@@ -164,47 +243,58 @@ Answer ONLY with one of the given grading or evaluation options.
         }, {})
 
         const columnsDataNames = ["columnData0"]
-        for (const [idx, columnName] of columnsDataNames.entries()) {
-            try {
-                setRowValue(rowIndex, "evaluationFlow", EvaluationFlow.COMPARISON_RUN_STARTED)
+        let idx = 0
+        for (const columnName of columnsDataNames) {
+            setRowValue(rowIndex, "evaluationFlow", EvaluationFlow.COMPARISON_RUN_STARTED)
 
-                let result = await callVariant(
-                    inputParamsDict,
-                    variantData[idx].inputParams,
-                    variantData[idx].optParams,
-                    variantData[idx].URIPath,
-                )
-                setRowValue(rowIndex, columnName, result)
-                await evaluate(rowIndex)
-                setShouldFetchResults(true)
-            } catch (e) {
-                message.error("Oops! Something went wrong")
+            let result = await callVariant(
+                inputParamsDict,
+                variantData[idx].inputParams!,
+                variantData[idx].optParams!,
+                appId || "",
+                variants[idx].baseId || "",
+                variantData[idx].isChatVariant
+                    ? testsetRowToChatMessages(evaluation.testset.csvdata[rowIndex], false)
+                    : [],
+            )
+
+            setRowValue(rowIndex, columnName as any, result)
+            await evaluate(rowIndex)
+            setShouldFetchResults(true)
+            if (rowIndex === rows.length - 1) {
+                message.success("Evaluation Results Saved")
             }
+            idx++
         }
     }
 
     const evaluate = async (rowNumber: number) => {
         const evaluation_scenario_id = rows[rowNumber].id
-        const appVariantNameX = variants[0].variantName
         const outputVariantX = rows[rowNumber].columnData0
 
         if (evaluation_scenario_id) {
             const data = {
-                outputs: [{variant_name: appVariantNameX, variant_output: outputVariantX}],
+                outputs: [{variant_id: variants[0].variantId, variant_output: outputVariantX}],
+            }
+
+            const aiCritiqueScoreResponse = await evaluateAICritiqueForEvalScenario({
+                correct_answer: rows[rowNumber].correctAnswer,
+                llm_app_prompt_template: evaluation.llmAppPromptTemplate,
                 inputs: rows[rowNumber].inputs,
+                outputs: data.outputs,
                 evaluation_prompt_template: evaluationPromptTemplate,
                 open_ai_key: getOpenAIKey(),
-            }
+            })
 
             try {
                 const responseData = await updateEvaluationScenario(
                     evaluation.id,
                     evaluation_scenario_id,
-                    data,
-                    evaluation.evaluationType,
+                    {...data, score: aiCritiqueScoreResponse.data},
+                    evaluation.evaluationType as EvaluationType,
                 )
                 setRowValue(rowNumber, "evaluationFlow", EvaluationFlow.EVALUATION_FINISHED)
-                setRowValue(rowNumber, "evaluation", responseData.evaluation)
+                setRowValue(rowNumber, "score", aiCritiqueScoreResponse.data)
             } catch (err) {
                 console.error(err)
             }
@@ -230,14 +320,7 @@ Answer ONLY with one of the given grading or evaluation options.
                 title: (
                     <div>
                         <span>App Variant: </span>
-                        <span
-                            style={{
-                                backgroundColor: "rgb(201 255 216)",
-                                color: "rgb(0 0 0)",
-                                padding: 4,
-                                borderRadius: 5,
-                            }}
-                        >
+                        <span className={classes.appVariant}>
                             {variants ? variants[i].variantName : ""}
                         </span>
                     </div>
@@ -246,16 +329,25 @@ Answer ONLY with one of the given grading or evaluation options.
                 key: columnKey,
                 width: "30%",
                 render: (text: any, record: AICritiqueEvaluationTableRow, rowIndex: number) => {
-                    if (record.evaluationFlow === EvaluationFlow.COMPARISON_RUN_STARTED) {
+                    if (
+                        record.evaluationFlow === EvaluationFlow.COMPARISON_RUN_STARTED &&
+                        evaluationStatus === EvaluationFlow.EVALUATION_STARTED
+                    ) {
                         return (
                             <center>
                                 <Spin />
                             </center>
                         )
                     }
+                    if (
+                        record.evaluationFlow === EvaluationFlow.COMPARISON_RUN_STARTED &&
+                        evaluationStatus === EvaluationFlow.EVALUATION_FAILED
+                    ) {
+                        return
+                    }
                     if (record.outputs && record.outputs.length > 0) {
                         const outputValue = record.outputs.find(
-                            (output: any) => output.variant_name === variants[i].variantName,
+                            (output: any) => output.variant_id === variants[i].variantId,
                         )?.variant_output
                         return <div>{outputValue}</div>
                     }
@@ -270,19 +362,10 @@ Answer ONLY with one of the given grading or evaluation options.
             key: "1",
             width: "30%",
             title: (
-                <div style={{display: "flex", justifyContent: "space-between"}}>
+                <div className={classes.inputTestContainer}>
                     <div>
                         <span> Inputs (Test set: </span>
-                        <span
-                            style={{
-                                backgroundColor: "rgb(201 255 216)",
-                                color: "rgb(0 0 0)",
-                                padding: 4,
-                                borderRadius: 5,
-                            }}
-                        >
-                            {evaluation.testset.name}
-                        </span>
+                        <span className={classes.inputTest}>{evaluation.testset.name}</span>
                         <span> )</span>
                     </div>
                 </div>
@@ -290,18 +373,22 @@ Answer ONLY with one of the given grading or evaluation options.
             dataIndex: "inputs",
             render: (text: any, record: AICritiqueEvaluationTableRow, rowIndex: number) => (
                 <div>
-                    {record &&
-                        record.inputs &&
-                        record.inputs.length && // initial value of inputs is array with 1 element and variantInputs could contain more than 1 element
-                        record.inputs.map((input: any, index: number) => (
-                            <div style={{marginBottom: 10}} key={index}>
-                                <Input
-                                    placeholder={input.input_name}
-                                    value={input.input_value}
-                                    onChange={(e) => handleInputChange(e, rowIndex, index)}
-                                />
-                            </div>
-                        ))}
+                    {evaluation.testset.testsetChatColumn
+                        ? evaluation.testset.csvdata[rowIndex][
+                              evaluation.testset.testsetChatColumn
+                          ] || " - "
+                        : record &&
+                          record.inputs &&
+                          record.inputs.length && // initial value of inputs is array with 1 element and variantInputs could contain more than 1 element
+                          record.inputs.map((input: any, index: number) => (
+                              <div className={classes.recordInput} key={index}>
+                                  <Input
+                                      placeholder={input.input_name}
+                                      value={input.input_value}
+                                      onChange={(e) => handleInputChange(e, record.id, index)}
+                                  />
+                              </div>
+                          ))}
                 </div>
             ),
         },
@@ -317,22 +404,31 @@ Answer ONLY with one of the given grading or evaluation options.
         {
             title: "Evaluation",
             dataIndex: "evaluation",
-            key: "evaluation",
+            key: "score",
             width: 200,
             align: "center" as "left" | "right" | "center",
-            render: (text: any, record: any, rowIndex: number) => {
-                if (record.evaluationFlow === "COMPARISON_RUN_STARTED") {
+            render: (score: string, record: any) => {
+                if (
+                    record.evaluationFlow === EvaluationFlow.COMPARISON_RUN_STARTED &&
+                    evaluationStatus === EvaluationFlow.EVALUATION_STARTED
+                ) {
                     return <Spin></Spin>
+                }
+                if (
+                    record.evaluationFlow === EvaluationFlow.COMPARISON_RUN_STARTED &&
+                    evaluationStatus === EvaluationFlow.EVALUATION_FAILED
+                ) {
+                    return
                 }
                 let tagColor = ""
 
                 return (
-                    <Spin spinning={rows[rowIndex].evaluation === "loading" ? true : false}>
+                    <Spin spinning={score === "loading"}>
                         <Space>
                             <div>
-                                {rows[rowIndex].evaluation !== "" && (
-                                    <Tag color={tagColor} style={{fontSize: "14px"}}>
-                                        {record.evaluation}
+                                {score !== "" && (
+                                    <Tag color={tagColor} className={classes.tag}>
+                                        {record.score}
                                     </Tag>
                                 )}
                             </div>
@@ -349,25 +445,13 @@ Answer ONLY with one of the given grading or evaluation options.
 
     return (
         <div>
-            <h1>AI Critique Evaluation</h1>
+            <Title level={2}>AI Critique Evaluation</Title>
             <div>
                 <div>
-                    <Card
-                        style={{
-                            marginTop: 16,
-                            width: "100%",
-                            border: "1px solid #ccc",
-                            marginRight: "24px",
-                            marginBottom: 30,
-                            backgroundColor: "rgb(246 253 245)",
-                        }}
-                        bodyStyle={{padding: "4px 16px", border: "0px solid #ccc"}}
-                        headStyle={{minHeight: 44, padding: "0px 12px"}}
-                        title="Evaluation strategy prompt"
-                    >
-                        <TextArea
+                    <Card className={classes.card} title="Evaluation strategy prompt">
+                        <Input.TextArea
+                            className={classes.cardTextarea}
                             rows={5}
-                            style={{height: 120, padding: "0px 0px"}}
                             bordered={false}
                             placeholder="e.g:"
                             onChange={onChangeEvaluationPromptTemplate}
@@ -375,62 +459,65 @@ Answer ONLY with one of the given grading or evaluation options.
                         />
                     </Card>
                 </div>
-                <Row align="middle" style={{marginBottom: 20}}>
+                <Row align="middle" className={classes.row}>
                     <Col span={12}>
-                        <Button
-                            type="primary"
-                            onClick={runAllEvaluations}
-                            icon={<LineChartOutlined />}
-                            size="large"
-                        >
-                            Run Evaluation
-                        </Button>
+                        <Space>
+                            <Button
+                                data-cy="ai-critic-run-evaluation"
+                                type="primary"
+                                onClick={runAllEvaluations}
+                                icon={<LineChartOutlined />}
+                                size="large"
+                            >
+                                Run Evaluation
+                            </Button>
+                            <SecondaryButton
+                                onClick={() => exportAICritiqueEvaluationData(evaluation, rows)}
+                                disabled={evaluationStatus !== EvaluationFlow.EVALUATION_FINISHED}
+                            >
+                                Export results
+                            </SecondaryButton>
+                        </Space>
                     </Col>
                 </Row>
             </div>
-            <div
-                style={{
-                    padding: "30px 10px",
-                    marginBottom: 20,
-                    backgroundColor: "rgb(244 244 244)",
-                    border: "1px solid #ccc",
-                    borderRadius: 5,
-                }}
-            >
+            <div className={classes.evaluationResult} data-cy="ai-critic-evaluation-result">
                 <center>
+                    {evaluationStatus === EvaluationFlow.EVALUATION_FAILED && (
+                        <div>Failed to run evaluation</div>
+                    )}
+
                     {evaluationStatus === EvaluationFlow.EVALUATION_INITIALIZED && (
                         <div>Run evaluation to see results!</div>
                     )}
+
                     {evaluationStatus === EvaluationFlow.EVALUATION_STARTED && <Spin />}
-                    {evaluationResults && evaluationResults.results_data && (
-                        <div>
-                            <h3 style={{marginTop: 0}}>Results Data:</h3>
-                            <Row
-                                gutter={8}
-                                justify="center"
-                                style={{maxWidth: "100%", overflowX: "auto", whiteSpace: "nowrap"}}
-                            >
-                                {Object.entries(evaluationResults.results_data).map(
-                                    ([key, value], index) => {
-                                        return (
-                                            <Col key={index} style={{display: "inline-block"}}>
+
+                    {evaluationStatus === EvaluationFlow.EVALUATION_FINISHED &&
+                        evaluationResults &&
+                        evaluationResults.results_data && (
+                            <div>
+                                <h3 className={classes.h3}>Results Data:</h3>
+                                <Row gutter={8} justify="center" className={classes.resultDataRow}>
+                                    {Object.entries(evaluationResults.results_data).map(
+                                        ([key, value], index) => (
+                                            <Col key={index} className={classes.resultDataCol}>
                                                 <Card
                                                     bordered={false}
-                                                    style={{width: 200, margin: "0 4px"}}
+                                                    className={classes.resultDataCard}
                                                 >
                                                     <Statistic
                                                         title={key}
-                                                        value={value}
-                                                        valueStyle={{color: "#3f8600"}}
+                                                        className={classes.stat}
+                                                        value={value as any}
                                                     />
                                                 </Card>
                                             </Col>
-                                        )
-                                    },
-                                )}
-                            </Row>
-                        </div>
-                    )}
+                                        ),
+                                    )}
+                                </Row>
+                            </div>
+                        )}
                 </center>
             </div>
             <div>

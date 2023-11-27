@@ -1,5 +1,14 @@
 import React from "react"
 import {Modal, Button} from "antd"
+import {createUseStyles} from "react-jss"
+
+const useStyles = createUseStyles({
+    container: {
+        display: "flex",
+        justifyContent: "flex-end",
+        gap: 10,
+    },
+})
 
 interface Props {
     isModalOpen: boolean
@@ -16,6 +25,7 @@ const EvaluationErrorModal: React.FC<Props> = ({
     btnText,
     onClose,
 }) => {
+    const classes = useStyles()
     const handleCloseModal = () => onClose()
 
     const handleCTAClick = () => {
@@ -24,13 +34,24 @@ const EvaluationErrorModal: React.FC<Props> = ({
     }
 
     return (
-        <Modal title="Error" open={isModalOpen} onCancel={handleCloseModal} footer={null} centered>
+        <Modal
+            title="Error"
+            open={isModalOpen}
+            onCancel={handleCloseModal}
+            footer={null}
+            centered
+            data-cy="evaluation-error-modal"
+        >
             <p>{message}</p>
-            <div style={{display: "flex", justifyContent: "flex-end"}}>
-                <Button onClick={handleCloseModal} style={{marginRight: 10}}>
+            <div className={classes.container}>
+                <Button onClick={handleCloseModal} data-cy="evaluation-error-modal-ok-button">
                     Ok
                 </Button>
-                <Button type="primary" onClick={handleCTAClick}>
+                <Button
+                    type="primary"
+                    onClick={handleCTAClick}
+                    data-cy="evaluation-error-modal-nav-button"
+                >
                     {btnText}
                 </Button>
             </div>

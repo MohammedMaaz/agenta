@@ -1,19 +1,29 @@
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict
-from datetime import datetime
 from enum import Enum
+from datetime import datetime
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any, Union
 
 
 class EvaluationTypeSettings(BaseModel):
     similarity_threshold: Optional[float]
+    regex_pattern: Optional[str]
+    regex_should_match: Optional[bool]
+    webhook_url: Optional[str]
+    custom_code_evaluation_id: Optional[str]
+    llm_app_prompt_template: Optional[str]
+    evaluation_prompt_template: Optional[str]
 
 
 class EvaluationType(str, Enum):
     auto_exact_match = "auto_exact_match"
     auto_similarity_match = "auto_similarity_match"
+    auto_regex_test = "auto_regex_test"
+    auto_webhook_test = "auto_webhook_test"
     auto_ai_critique = "auto_ai_critique"
     human_a_b_testing = "human_a_b_testing"
     human_scoring = "human_scoring"
+    custom_code_run = "custom_code_run"
+    single_model_test = "single_model_test"
 
 
 class EvaluationStatusEnum(str, Enum):
@@ -23,21 +33,33 @@ class EvaluationStatusEnum(str, Enum):
     EVALUATION_FINISHED = "EVALUATION_FINISHED"
 
 
-class EvaluationStatus(BaseModel):
-    status: EvaluationStatusEnum
-
-
 class Evaluation(BaseModel):
     id: str
-    status: str
+    app_id: str
+    user_id: str
+    user_username: str
     evaluation_type: EvaluationType
     evaluation_type_settings: Optional[EvaluationTypeSettings]
-    llm_app_prompt_template: Optional[str]
-    variants: Optional[List[str]]
-    app_name: str
-    testset: Dict[str, str] = Field(...)
+    variant_ids: List[str]
+    variant_names: List[str]
+    testset_id: str
+    testset_name: str
+    status: str
     created_at: datetime
     updated_at: datetime
+
+
+class SimpleEvaluationOutput(BaseModel):
+    id: str
+    variant_ids: List[str]
+    app_id: str
+    status: str
+    evaluation_type: EvaluationType
+
+
+class EvaluationUpdate(BaseModel):
+    status: Optional[EvaluationStatusEnum]
+    evaluation_type_settings: Optional[EvaluationTypeSettings]
 
 
 class EvaluationScenarioInput(BaseModel):
@@ -46,39 +68,94 @@ class EvaluationScenarioInput(BaseModel):
 
 
 class EvaluationScenarioOutput(BaseModel):
-    variant_name: str
+    variant_id: str
     variant_output: str
 
 
 class EvaluationScenario(BaseModel):
+    id: Optional[str]
     evaluation_id: str
     inputs: List[EvaluationScenarioInput]
     outputs: List[EvaluationScenarioOutput]
     vote: Optional[str]
-    score: Optional[str]
+    score: Optional[Union[str, int]]
     evaluation: Optional[str]
     correct_answer: Optional[str]
-    id: Optional[str]
+    is_pinned: Optional[bool]
+    note: Optional[str]
 
 
-class EvaluationScenarioUpdate(BaseModel):
-    vote: Optional[str]
-    score: Optional[str]
+class AICritiqueCreate(BaseModel):
+    correct_answer: str
+    llm_app_prompt_template: Optional[str]
+    inputs: List[EvaluationScenarioInput]
     outputs: List[EvaluationScenarioOutput]
     evaluation_prompt_template: Optional[str]
     open_ai_key: Optional[str]
 
 
+class EvaluationScenarioUpdate(BaseModel):
+    vote: Optional[str]
+    score: Optional[Union[str, int]]
+    correct_answer: Optional[str]  # will be used when running custom code evaluation
+    outputs: Optional[List[EvaluationScenarioOutput]]
+    inputs: Optional[List[EvaluationScenarioInput]]
+    is_pinned: Optional[bool]
+    note: Optional[str]
+
+
+class EvaluationScenarioScoreUpdate(BaseModel):
+    score: float
+
+
 class NewEvaluation(BaseModel):
+    app_id: str
+    variant_ids: List[str]
     evaluation_type: EvaluationType
     evaluation_type_settings: Optional[EvaluationTypeSettings]
-    app_name: str
-    variants: List[str]
     inputs: List[str]
-    testset: Dict[str, str] = Field(...)
-    status: str = Field(...)
-    llm_app_prompt_template: Optional[str]
+    testset_id: str
+    status: str
 
 
 class DeleteEvaluation(BaseModel):
     evaluations_ids: List[str]
+
+
+class CreateCustomEvaluation(BaseModel):
+    evaluation_name: str
+    python_code: str
+    app_id: str
+
+
+class CustomEvaluationOutput(BaseModel):
+    id: str
+    app_id: str
+    evaluation_name: str
+    created_at: datetime
+
+
+class CustomEvaluationDetail(BaseModel):
+    id: str
+    app_id: str
+    evaluation_name: str
+    python_code: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class CustomEvaluationNames(BaseModel):
+    id: str
+    evaluation_name: str
+
+
+class ExecuteCustomEvaluationCode(BaseModel):
+    inputs: List[Dict[str, Any]]
+    app_id: str
+    variant_id: str
+    correct_answer: str
+    outputs: List[Dict[str, Any]]
+
+
+class EvaluationWebhook(BaseModel):
+    score: float

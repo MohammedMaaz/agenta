@@ -15,15 +15,26 @@ import {
     Typography,
     message,
 } from "antd"
-import {Variant} from "@/lib/Types"
-import {updateEvaluationScenario, callVariant} from "@/lib/services/api"
-import {useVariant} from "@/lib/hooks/useVariant"
+import {
+    updateEvaluationScenario,
+    callVariant,
+    fetchEvaluationResults,
+    updateEvaluation,
+} from "@/lib/services/api"
+import {useVariants} from "@/lib/hooks/useVariant"
 import {useRouter} from "next/router"
 import {EvaluationFlow} from "@/lib/enums"
 import {evaluateWithExactMatch} from "@/lib/services/evaluations"
+import {createUseStyles} from "react-jss"
+import {exportExactEvaluationData} from "@/lib/helpers/evaluate"
+import SecondaryButton from "../SecondaryButton/SecondaryButton"
+import {testsetRowToChatMessages} from "@/lib/helpers/testset"
+import {Evaluation} from "@/lib/Types"
+
+const {Title} = Typography
 
 interface ExactMatchEvaluationTableProps {
-    evaluation: any
+    evaluation: Evaluation
     columnsCount: number
     evaluationScenarios: ExactMatchEvaluationTableRow[]
 }
@@ -35,7 +46,7 @@ interface ExactMatchEvaluationTableRow {
         input_value: string
     }[]
     outputs: {
-        variant_name: string
+        variant_id: string
         variant_output: string
     }[]
     columnData0: string
@@ -51,45 +62,77 @@ interface ExactMatchEvaluationTableRow {
  * @returns
  */
 
+const useStyles = createUseStyles({
+    appVariant: {
+        backgroundColor: "rgb(201 255 216)",
+        color: "rgb(0 0 0)",
+        padding: 4,
+        borderRadius: 5,
+    },
+    inputTestContainer: {
+        display: "flex",
+        justifyContent: "space-between",
+    },
+    inputTest: {
+        backgroundColor: "rgb(201 255 216)",
+        color: "rgb(0 0 0)",
+        padding: 4,
+        borderRadius: 5,
+    },
+    recordInput: {
+        marginBottom: 10,
+    },
+    tag: {
+        fontSize: "14px",
+    },
+    card: {
+        marginBottom: 20,
+    },
+    statCorrect: {
+        "& .ant-statistic-content-value": {
+            color: "#3f8600",
+        },
+    },
+    statWrong: {
+        "& .ant-statistic-content-value": {
+            color: "#cf1322",
+        },
+    },
+})
+
 const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
     evaluation,
     evaluationScenarios,
     columnsCount,
 }) => {
+    const classes = useStyles()
     const router = useRouter()
-    const appName = Array.isArray(router.query.app_name)
-        ? router.query.app_name[0]
-        : router.query.app_name || ""
+    const appId = router.query.app_id as string
     const variants = evaluation.variants
 
-    const variantData = variants.map((variant: Variant) => {
-        const {inputParams, optParams, URIPath, isLoading, isError, error} = useVariant(
-            appName,
-            variant,
-        )
-
-        return {
-            inputParams,
-            optParams,
-            URIPath,
-            isLoading,
-            isError,
-            error,
-        }
-    })
+    const variantData = useVariants(appId, variants)
 
     const [rows, setRows] = useState<ExactMatchEvaluationTableRow[]>([])
     const [wrongAnswers, setWrongAnswers] = useState<number>(0)
     const [correctAnswers, setCorrectAnswers] = useState<number>(0)
     const [accuracy, setAccuracy] = useState<number>(0)
-
-    const {Title} = Typography
+    const [evaluationStatus, setEvaluationStatus] = useState<EvaluationFlow>(evaluation.status)
 
     useEffect(() => {
         if (evaluationScenarios) {
             setRows(evaluationScenarios)
         }
     }, [evaluationScenarios])
+
+    useEffect(() => {
+        if (evaluationStatus === EvaluationFlow.EVALUATION_FINISHED) {
+            fetchEvaluationResults(evaluation.id)
+                .then(() => {
+                    updateEvaluation(evaluation.id, {status: EvaluationFlow.EVALUATION_FINISHED})
+                })
+                .catch((err) => console.error("Failed to fetch results:", err))
+        }
+    }, [evaluationStatus, evaluation.id])
 
     useEffect(() => {
         if (correctAnswers + wrongAnswers > 0) {
@@ -111,7 +154,7 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
 
     const handleInputChange = (
         e: React.ChangeEvent<HTMLInputElement>,
-        rowIndex: number,
+        rowIndex: any,
         inputFieldKey: number,
     ) => {
         const newRows = [...rows]
@@ -120,6 +163,7 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
     }
 
     const runAllEvaluations = async () => {
+        setEvaluationStatus(EvaluationFlow.EVALUATION_STARTED)
         const promises: Promise<void>[] = []
 
         for (let i = 0; i < rows.length; i++) {
@@ -129,6 +173,7 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
         Promise.all(promises)
             .then(() => {
                 console.log("All functions finished.")
+                setEvaluationStatus(EvaluationFlow.EVALUATION_FINISHED)
             })
             .catch((err) => console.error("An error occurred:", err))
     }
@@ -145,16 +190,24 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
             try {
                 let result = await callVariant(
                     inputParamsDict,
-                    variantData[idx].inputParams,
-                    variantData[idx].optParams,
-                    variantData[idx].URIPath,
+                    variantData[idx].inputParams!,
+                    variantData[idx].optParams!,
+                    appId || "",
+                    variants[idx].baseId || "",
+                    variantData[idx].isChatVariant
+                        ? testsetRowToChatMessages(evaluation.testset.csvdata[rowIndex], false)
+                        : [],
                 )
+
                 setRowValue(rowIndex, columnName, result)
                 setRowValue(rowIndex, "evaluationFlow", EvaluationFlow.COMPARISON_RUN_STARTED)
                 evaluate(rowIndex)
-            } catch (e) {
+                if (rowIndex === rows.length - 1) {
+                    message.success("Evaluation Results Saved")
+                }
+            } catch (err) {
+                console.log("Error running evaluation:", err)
                 setRowValue(rowIndex, columnName, "")
-                message.error("Oops! Something went wrong")
             }
         })
     }
@@ -176,13 +229,12 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
 
         const evaluation_scenario_id = rows[rowNumber].id
         // TODO: we need to improve this and make it dynamic
-        const appVariantNameX = variants[0].variantName
         const outputVariantX = rows[rowNumber].columnData0
 
         if (evaluation_scenario_id) {
             const data = {
                 score: isCorrect ? "correct" : "wrong",
-                outputs: [{variant_name: appVariantNameX, variant_output: outputVariantX}],
+                outputs: [{variant_id: variants[0].variantId, variant_output: outputVariantX}],
             }
 
             updateEvaluationScenario(
@@ -191,7 +243,7 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
                 data,
                 evaluation.evaluationType,
             )
-                .then((data) => {
+                .then(() => {
                     setRowValue(rowNumber, "score", data.score)
                     if (isCorrect) {
                         setCorrectAnswers((prevCorrect) => prevCorrect + 1)
@@ -224,14 +276,7 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
                 title: (
                     <div>
                         <span>App Variant: </span>
-                        <span
-                            style={{
-                                backgroundColor: "rgb(201 255 216)",
-                                color: "rgb(0 0 0)",
-                                padding: 4,
-                                borderRadius: 5,
-                            }}
-                        >
+                        <span className={classes.appVariant}>
                             {variants ? variants[i].variantName : ""}
                         </span>
                     </div>
@@ -242,7 +287,7 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
                 render: (text: any, record: ExactMatchEvaluationTableRow, rowIndex: number) => {
                     if (record.outputs && record.outputs.length > 0) {
                         const outputValue = record.outputs.find(
-                            (output: any) => output.variant_name === variants[i].variantName,
+                            (output: any) => output.variant_id === variants[i].variantId,
                         )?.variant_output
                         return <div>{outputValue}</div>
                     }
@@ -257,19 +302,10 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
             key: "1",
             width: "30%",
             title: (
-                <div style={{display: "flex", justifyContent: "space-between"}}>
+                <div className={classes.inputTestContainer}>
                     <div>
                         <span> Inputs (Test set: </span>
-                        <span
-                            style={{
-                                backgroundColor: "rgb(201 255 216)",
-                                color: "rgb(0 0 0)",
-                                padding: 4,
-                                borderRadius: 5,
-                            }}
-                        >
-                            {evaluation.testset.name}
-                        </span>
+                        <span className={classes.inputTest}>{evaluation.testset.name}</span>
                         <span> )</span>
                     </div>
                 </div>
@@ -277,18 +313,22 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
             dataIndex: "inputs",
             render: (text: any, record: ExactMatchEvaluationTableRow, rowIndex: number) => (
                 <div>
-                    {record &&
-                        record.inputs &&
-                        record.inputs.length && // initial value of inputs is array with 1 element and variantInputs could contain more than 1 element
-                        record.inputs.map((input: any, index: number) => (
-                            <div style={{marginBottom: 10}} key={index}>
-                                <Input
-                                    placeholder={input.input_name}
-                                    value={input.input_value}
-                                    onChange={(e) => handleInputChange(e, rowIndex, index)}
-                                />
-                            </div>
-                        ))}
+                    {evaluation.testset.testsetChatColumn
+                        ? evaluation.testset.csvdata[rowIndex][
+                              evaluation.testset.testsetChatColumn
+                          ] || " - "
+                        : record &&
+                          record.inputs &&
+                          record.inputs.length && // initial value of inputs is array with 1 element and variantInputs could contain more than 1 element
+                          record.inputs.map((input: any, index: number) => (
+                              <div className={classes.recordInput} key={index}>
+                                  <Input
+                                      placeholder={input.input_name}
+                                      value={input.input_value}
+                                      onChange={(e) => handleInputChange(e, record.id, index)}
+                                  />
+                              </div>
+                          ))}
                 </div>
             ),
         },
@@ -319,7 +359,11 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
                         <Space>
                             <div>
                                 {rows[rowIndex].score !== "" && (
-                                    <Tag color={tagColor} style={{fontSize: "14px"}}>
+                                    <Tag
+                                        data-cy="exact-match-evaluation-score"
+                                        color={tagColor}
+                                        className={classes.tag}
+                                    >
                                         {record.score}
                                     </Tag>
                                 )}
@@ -333,35 +377,44 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
 
     return (
         <div>
-            <h1>Exact match Evaluation</h1>
+            <Title level={2}>Exact match Evaluation</Title>
             <div>
                 <Row align="middle">
                     <Col span={12}>
-                        <Button
-                            type="primary"
-                            onClick={runAllEvaluations}
-                            icon={<LineChartOutlined />}
-                            size="large"
-                        >
-                            Run Evaluation
-                        </Button>
+                        <Space>
+                            <Button
+                                data-cy="exact-match-evaluation-button"
+                                type="primary"
+                                onClick={runAllEvaluations}
+                                icon={<LineChartOutlined />}
+                                size="large"
+                            >
+                                Run Evaluation
+                            </Button>
+                            <SecondaryButton
+                                onClick={() => exportExactEvaluationData(evaluation, rows)}
+                                disabled={evaluationStatus !== EvaluationFlow.EVALUATION_FINISHED}
+                            >
+                                Export results
+                            </SecondaryButton>
+                        </Space>
                     </Col>
 
                     <Col span={12}>
-                        <Card bordered={true} style={{marginBottom: 20}}>
+                        <Card bordered={true} className={classes.card}>
                             <Row justify="end">
                                 <Col span={10}>
                                     <Statistic
                                         title="Correct answers:"
                                         value={`${correctAnswers} out of ${rows.length}`}
-                                        valueStyle={{color: "#3f8600"}}
+                                        className={classes.statCorrect}
                                     />
                                 </Col>
                                 <Col span={10}>
                                     <Statistic
                                         title="Wrong answers:"
                                         value={`${wrongAnswers} out of ${rows.length}`}
-                                        valueStyle={{color: "#cf1322"}}
+                                        className={classes.statWrong}
                                     />
                                 </Col>
                                 <Col span={4}>
@@ -369,7 +422,6 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
                                         title="Accuracy:"
                                         value={accuracy}
                                         precision={2}
-                                        valueStyle={{color: ""}}
                                         suffix="%"
                                     />
                                 </Col>
@@ -384,6 +436,7 @@ const ExactMatchEvaluationTable: React.FC<ExactMatchEvaluationTableProps> = ({
                     columns={columns}
                     pagination={false}
                     rowClassName={() => "editable-row"}
+                    rowKey="id"
                 />
             </div>
         </div>

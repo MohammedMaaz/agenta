@@ -1,4 +1,6 @@
+import dynamic from "next/dynamic"
 import {EvaluationType} from "../enums"
+import {GenericObject} from "../Types"
 
 const openAItoken = "openAiToken"
 
@@ -18,8 +20,12 @@ export const EvaluationTypeLabels: Record<EvaluationType, string> = {
     [EvaluationType.auto_exact_match]: "Exact Match",
     [EvaluationType.auto_similarity_match]: "Similarity Match",
     [EvaluationType.auto_ai_critique]: "AI Critic",
-    [EvaluationType.human_a_b_testing]: "A/B testing",
+    [EvaluationType.human_a_b_testing]: "A/B Test",
     [EvaluationType.human_scoring]: "Scoring single variant",
+    [EvaluationType.custom_code_run]: "Custom Code Run",
+    [EvaluationType.auto_regex_test]: "Regex Test",
+    [EvaluationType.auto_webhook_test]: "Webhook Test",
+    [EvaluationType.single_model_test]: "Single Model Test",
 }
 
 export const saveOpenAIKey = (key: string) => {
@@ -30,18 +36,19 @@ export const saveOpenAIKey = (key: string) => {
 }
 
 export const getOpenAIKey = (): string => {
-    let token: string | null = ""
-
+    // precedence order: local storage, env variable, empty string
+    let key
     if (typeof window !== "undefined") {
-        // TODO: add decryption here
-        token = localStorage.getItem(openAItoken)
+        key = localStorage.getItem(openAItoken)
     }
-
-    return token ?? ""
+    const keyFromEnv = (window as any).Cypress ? "" : process.env.NEXT_PUBLIC_OPENAI_API_KEY
+    return key ?? keyFromEnv ?? ""
 }
 
 export const removeOpenAIKey = () => {
-    localStorage.removeItem(openAItoken)
+    if (typeof window !== "undefined") {
+        localStorage.removeItem(openAItoken)
+    }
 }
 
 export const capitalize = (s: string) => {
@@ -52,7 +59,7 @@ export const capitalize = (s: string) => {
         .join(" ")
 }
 
-export const randString = (len: number) =>
+export const randString = (len: number = 8) =>
     window
         .btoa(
             Array.from(window.crypto.getRandomValues(new Uint8Array(len * 2)))
@@ -78,6 +85,8 @@ export const convertToCsv = (rows: RowType[], header: (string | undefined)[]): s
 }
 
 export const downloadCsv = (csvContent: string, filename: string): void => {
+    if (typeof window === "undefined") return
+
     const blob = new Blob([csvContent], {type: "text/csv"})
     const link = document.createElement("a")
     link.href = URL.createObjectURL(blob)
@@ -85,4 +94,76 @@ export const downloadCsv = (csvContent: string, filename: string): void => {
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
+}
+
+export const delay = (ms: number) => new Promise((res) => setTimeout(res, ms))
+
+export const snakeToCamel = (str: string) =>
+    str.replace(/([-_][a-z])/g, (group) => group.toUpperCase().replace("-", "").replace("_", ""))
+
+export const camelToSnake = (str: string) =>
+    str.replace(/([A-Z])/g, (group) => `_${group.toLowerCase()}`)
+
+export const stringToNumberInRange = (text: string, min: number, max: number) => {
+    // Calculate a hash value from the input string
+    let hash = 0
+    for (let i = 0; i < text.length; i++) {
+        hash += text.charCodeAt(i)
+    }
+
+    // Map the hash value to the desired range
+    const range = max - min + 1
+    const mappedValue = ((hash % range) + range) % range
+
+    // Add the minimum value to get the final result within the range
+    const result = min + mappedValue
+
+    return result
+}
+
+export const getInitials = (str: string, limit = 2) => {
+    let initialText = "E"
+
+    try {
+        initialText = str
+            ?.split(" ")
+            .slice(0, limit)
+            ?.reduce((acc, curr) => acc + (curr[0] || "")?.toUpperCase(), "")
+    } catch (error) {
+        console.log("Error using getInitials", error)
+    }
+
+    return initialText
+}
+
+export const isDemo = () => {
+    if (process.env.NEXT_PUBLIC_FF) {
+        return ["cloud", "ee"].includes(process.env.NEXT_PUBLIC_FF)
+    }
+    return false
+}
+
+export function dynamicComponent<T>(path: string, fallback: any = () => null) {
+    return dynamic<T>(() => import(`@/components/${path}`), {
+        loading: fallback,
+        ssr: false,
+    })
+}
+
+export const removeKeys = (obj: GenericObject, keys: string[]) => {
+    let newObj = Object.assign({}, obj)
+    for (let key of keys) {
+        delete newObj[key]
+    }
+    return newObj
+}
+
+export const safeParse = (str: string, fallback: any = "") => {
+    try {
+        return JSON.parse(str)
+    } catch (error) {
+        console.log("error parsing JSON:", error)
+        console.log("fallbacking to:", fallback)
+        return fallback
+    }
 }
